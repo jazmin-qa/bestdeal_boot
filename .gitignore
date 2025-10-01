@@ -1,0 +1,9 @@
+# Ignorar todo
+*
+
+# Permitir solo estos dos archivos
+!ocr_familiar.py
+!scr_familiar.py
+
+# También permitir el .gitignore en sí
+!.gitignore
