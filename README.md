@@ -39,7 +39,7 @@ $env:GEMINI_API_KEY = "TU_API_KEY_AQUÍ"
 # En Bash (Linux/macOS)
 export GEMINI_API_KEY="TU_API_KEY_AQUÍ"
 
-INSTALAR DEPENDENCIAS:
+# INSTALAR DEPENDENCIAS:
 pip install genai
 pip install pdfplumber
 pip install requests
