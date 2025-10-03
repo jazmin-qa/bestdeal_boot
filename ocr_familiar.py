@@ -68,7 +68,17 @@ def extract_text_with_gemini(filepath):
         - **Nunca uses cadenas vacías en valid_from o valid_to**.  
         - Normaliza el método de pago a: "Tarjetas de crédito".  
         - Si otros campos no existen en el texto, usa una cadena vacía "".
-        - Responde ÚNICAMENTE con JSON válido y con la siguiente estructura exacta:
+
+        Reglas adicionales para "benefic":
+        - Si aparece un beneficio con cuotas, por ejemplo:  
+          "Fraccionar sus compras hasta en 12 (Doce) cuotas sin intereses",  
+          extrae y normaliza únicamente como: **"12 cuotas sin intereses"**.
+        - Si aparece un beneficio con reintegro, por ejemplo:  
+          "recibirá 20% de reintegro en el extracto de la tarjeta de crédito...",  
+          extrae y normaliza únicamente como: **"20% de reintegro"**.
+        - Si el beneficio está redactado en un texto largo, identifica el porcentaje o número de cuotas y devuélvelo en el formato simplificado anterior.
+
+        Responde ÚNICAMENTE con JSON válido y con la siguiente estructura exacta:
 
         {{
         "promociones": [
@@ -98,6 +108,7 @@ def extract_text_with_gemini(filepath):
         - Si no se pueden extraer fechas tras una revisión completa, devuelve únicamente: {{"error": "No se pudo extraer VIGENCIA"}}.
         - Mantén estrictamente la estructura de JSON indicada.
         """
+
         response = model.generate_content(prompt)
         extracted_text = response.text.strip()
 
@@ -109,7 +120,7 @@ def extract_text_with_gemini(filepath):
     except Exception as e:
         print(f"⚠ Error en Gemini API: {e}")
         return None, None
-    
+
 
 def parse_gemini_response(gemini_response, full_text):
     """Parsea la respuesta de Gemini y cruza promociones con comercios (rellenando campos)."""

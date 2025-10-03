@@ -184,7 +184,7 @@ def main():
     print(f"📋 Categorías encontradas: {categorias}")
 
     # Filtro de categorías
-    categorias_filtradas = [c for c in categorias if c in ["Supermercado"]]
+    categorias_filtradas = [c for c in categorias if c in ["Bienestar y Salud", "Automotor/Combustible", "Supermercado"]]
     print(f"✅ Categorías a procesar: {categorias_filtradas}")
 
     for categoria in categorias_filtradas:
