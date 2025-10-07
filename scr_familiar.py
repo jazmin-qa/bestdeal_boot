@@ -86,34 +86,78 @@ def descargar_archivos_categoria(driver, categoria):
         items = driver.find_elements(By.XPATH, "//div[@role='listitem' and contains(@class,'collection-item')]")
         for idx, item in enumerate(items, 1):
 
-            # PDFs
+            pdf_nombre = ""
+            pdf_url = ""
+            filepath = ""
+            logo_url = ""
+
+            # Obtener nombre del comercio si existe
+            comercio_nombre = ""
+            try:
+                comercio_elem = item.find_element(By.XPATH, ".//p[@fs-list-field='name']")
+                comercio_nombre = comercio_elem.text.strip()
+            except NoSuchElementException:
+                comercio_nombre = ""
+
+            # Intentar obtener el logo primero
+            try:
+                logo_elem = item.find_element(By.XPATH, ".//img[contains(@src,'http')]")
+                logo_url = logo_elem.get_attribute("src")
+            except NoSuchElementException:
+                pass
+
+            # Luego intentar obtener el PDF
             try:
                 pdf_elem = item.find_element(By.XPATH, ".//a[contains(@href,'.pdf')]")
                 pdf_url = pdf_elem.get_attribute("href")
                 filename = pdf_url.split("/")[-1]
                 filepath = os.path.join(pdf_folder, filename)
 
-                if pdf_url not in urls_descargadas:  # evitar duplicados
+                if pdf_url not in urls_descargadas:
                     if not os.path.exists(filepath):
                         resp = requests.get(pdf_url, timeout=10)
                         with open(filepath, "wb") as f:
                             f.write(resp.content)
-                        total_pdfs += 1
-                        print(f"   ➡ PDF descargado: {filepath}")
-                        time.sleep(0.5)
-
-                    lista_pdfs.append({"categoria": categoria, "nombre": filename, "url": pdf_url})
-                    global_pdfs.append({
-                        "categoria": categoria,
-                        "nombre": filename,
-                        "url": pdf_url,
-                        "ruta_local": filepath
-                    })
-                    registros_globales.append({"tipo": "pdf", "categoria": categoria, "nombre": filename, "url": pdf_url})
                     urls_descargadas.add(pdf_url)
+
+                pdf_nombre = filename
+
+                # Guardar PDF con logo asociado
+                lista_pdfs.append({
+                    "categoria": categoria,
+                    "nombre": filename,
+                    "url": pdf_url,
+                    "ruta_local": filepath,
+                    "logo_asociado": logo_url,  # ahora sí existe logo_url
+                    "comercio": comercio_nombre
+                })
+                global_pdfs.append({
+                    "categoria": categoria,
+                    "nombre": filename,
+                    "url": pdf_url,
+                    "ruta_local": filepath,
+                    "logo_asociado": logo_url,
+                    "comercio": comercio_nombre
+                })
 
             except NoSuchElementException:
                 pass
+
+            # Guardar logo con PDF asociado (si existe alguno de los dos)
+            if logo_url:
+                lista_logos.append({
+                    "categoria": categoria,
+                    "url": logo_url,
+                    "pdf_asociado": pdf_nombre,
+                    "comercio": comercio_nombre
+                })
+                global_logos.append({
+                    "categoria": categoria,
+                    "url": logo_url,
+                    "pdf_asociado": pdf_nombre,
+                    "comercio": comercio_nombre
+                })
+
 
             # Logos
             try:
@@ -121,13 +165,17 @@ def descargar_archivos_categoria(driver, categoria):
                 logo_url = logo_elem.get_attribute("src")
 
                 if logo_url not in urls_descargadas:
-                    lista_logos.append({"categoria": categoria, "url": logo_url})
-                    global_logos.append({"categoria": categoria, "url": logo_url})
-                    registros_globales.append({"tipo": "logo", "categoria": categoria, "nombre": "", "url": logo_url})
-                    total_logos += 1
+                    lista_logos.append({
+                        "categoria": categoria,
+                        "url": logo_url,
+                        "pdf_asociado": pdf_nombre  # <-- Vincular logo con PDF del mismo item
+                    })
+                    global_logos.append({
+                        "categoria": categoria,
+                        "url": logo_url,
+                        "pdf_asociado": pdf_nombre
+                    })
                     urls_descargadas.add(logo_url)
-                    print(f"   ➡ Logo registrado: {logo_url}")
-                    time.sleep(0.5)
 
             except NoSuchElementException:
                 pass
@@ -152,12 +200,12 @@ def descargar_archivos_categoria(driver, categoria):
 
     # CSVs por categoría
     with open(os.path.join(base_folder, "pdfs.csv"), "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["categoria", "nombre", "url"])
+        writer = csv.DictWriter(f, fieldnames=["categoria", "nombre", "url", "ruta_local", "logo_asociado", "comercio"])
         writer.writeheader()
         writer.writerows(lista_pdfs)
 
     with open(os.path.join(base_folder, "logos.csv"), "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["categoria", "url"])
+        writer = csv.DictWriter(f, fieldnames=["categoria", "url", "pdf_asociado", "comercio"])
         writer.writeheader()
         writer.writerows(lista_logos)
 
@@ -184,7 +232,7 @@ def main():
     print(f"📋 Categorías encontradas: {categorias}")
 
     # Filtro de categorías
-    categorias_filtradas = [c for c in categorias if c in ["Bienestar y Salud", "Automotor/Combustible", "Supermercado"]]
+    categorias_filtradas = [c for c in categorias if c in ["Supermercado", "Automotor/Combustible", "Bienestar y Salud"]]
     print(f"✅ Categorías a procesar: {categorias_filtradas}")
 
     for categoria in categorias_filtradas:
@@ -195,7 +243,7 @@ def main():
     # Consolidado global PDFs
     if global_pdfs:
         with open("data/pdfs_totales.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["categoria", "nombre", "url", "ruta_local"])
+            writer = csv.DictWriter(f, fieldnames=["categoria", "nombre", "url", "ruta_local", "logo_asociado", "comercio"])
             writer.writeheader()
             writer.writerows(global_pdfs)
         print(f"\n📊 Consolidado global PDFs: data/pdfs_totales.csv ({len(global_pdfs)} registros)")
@@ -205,7 +253,7 @@ def main():
     # Consolidado global Logos
     if global_logos:
         with open("data/logos_totales.csv", "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["categoria", "url"])
+            writer = csv.DictWriter(f, fieldnames=["categoria", "url", "pdf_asociado", "comercio"])
             writer.writeheader()
             writer.writerows(global_logos)
         print(f"📊 Consolidado global Logos: data/logos_totales.csv ({len(global_logos)} registros)")
