@@ -5,6 +5,9 @@
 !ocr_familiar.py
 !scr_familiar.py
 !.gitignore
+!ocr_gnbpy.py
+!scr_gnbpy.py
+
 
 # Ignorar carpetas comunes
 __pycache__/
