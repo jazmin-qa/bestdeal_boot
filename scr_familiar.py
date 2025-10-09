@@ -216,12 +216,14 @@ def main():
     global global_pdfs, global_logos
 
     options = webdriver.FirefoxOptions()
-    # options.add_argument("--headless")
+    options.binary_location = "/opt/firefox/firefox" 
+    #options.add_argument("--headless")
 
     driver = webdriver.Firefox(
         service=Service(GeckoDriverManager().install()),
         options=options
     )
+
     driver.get("https://www.familiar.com.py/promociones-tarjetas")
 
     wait = WebDriverWait(driver, 30)

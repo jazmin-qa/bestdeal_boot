@@ -18,7 +18,7 @@ DB_CONFIG = {
 }
 
 LOG_FILE = "data/procesamiento.log"
-# Archivos de entrada/salida
+# Archivos de entrada/salida  
 PDFS_CSV = "data/pdfs_totales.csv"
 OUTPUT_CSV = "data/gemini_resultados_ok.csv"
 
@@ -165,7 +165,7 @@ def ajustar_nombre_comercio(nombre_csv, nombre_pdf, umbral=0.7):
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Reemplaza con tu API key de Gemini
 if not GEMINI_API_KEY:
     print("❌ Error: No se encontró la API key en la variable de entorno GEMINI_API_KEY")
-    print("💡 En PowerShell puedes configurarla así:")
+    print("💡 En PowerShell puedes configurarla así (WINDOWS):")
     print('$env:GEMINI_API_KEY="AIxxxxxxxxxxxxxxxxxxxxxxxx"')
     exit(1)
 

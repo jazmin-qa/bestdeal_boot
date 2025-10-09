@@ -4,11 +4,11 @@ import requests
 import csv
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.firefox.service import Service
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from webdriver_manager.firefox import GeckoDriverManager
+from webdriver_manager.chrome import ChromeDriverManager
 
 # ===============================
 # CONFIGURACIÓN
@@ -26,9 +26,16 @@ if not os.path.exists(CSV_FILE):
 # ===============================
 # INICIAR NAVEGADOR
 # ===============================
-print("🚀 Iniciando navegador Firefox...")
-service = Service(GeckoDriverManager().install())
-driver = webdriver.Firefox(service=service)
+print("🚀 Iniciando navegador Google Chrome...")
+options = webdriver.ChromeOptions()
+
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+# Maximizar ventana al iniciar
+options.add_argument("--start-maximized")
+
+service = Service(ChromeDriverManager().install())
+driver = webdriver.Chrome(service=service, options=options)
 wait = WebDriverWait(driver, 15)
 
 def animar(texto, duracion=2):
@@ -38,18 +45,27 @@ def animar(texto, duracion=2):
         time.sleep(0.5)
     print(" ✅")
 
-def descargar_pdf(pdf_url):
-    """Descarga el PDF usando su nombre original de la URL"""
+def descargar_pdf(pdf_url, categoria_nombre):
+    """Descarga el PDF dentro de una subcarpeta según su categoría"""
+    
+    # Crear la subcarpeta de la categoría si no existe
+    carpeta_categoria = os.path.join(OUTPUT_DIR, categoria_nombre)
+    os.makedirs(carpeta_categoria, exist_ok=True)
+
+    # Nombre del PDF
+    nombre_pdf = pdf_url.split("/")[-1]
+    ruta_pdf = os.path.join(carpeta_categoria, nombre_pdf)
+
+    # Descargar PDF
     response = requests.get(pdf_url, stream=True)
     response.raise_for_status()
-    nombre_pdf = pdf_url.split("/")[-1]  # extrae el nombre original
-    ruta_pdf = os.path.join(OUTPUT_DIR, nombre_pdf)
     with open(ruta_pdf, "wb") as f:
         for chunk in response.iter_content(chunk_size=1024):
             if chunk:
                 f.write(chunk)
-    return ruta_pdf
 
+    print(f"✅ PDF guardado en: {ruta_pdf}")
+    return ruta_pdf
 
 def procesar_ofertas(categoria_url, categoria_nombre):
     """Procesa todas las ofertas visibles de una categoría/etiqueta"""
@@ -93,7 +109,7 @@ def procesar_ofertas(categoria_url, categoria_nombre):
         try:
             enlace_pdf = wait.until(EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "Bases y Condiciones")))
             pdf_url = enlace_pdf.get_attribute("href")
-            ruta_pdf = descargar_pdf(pdf_url)
+            ruta_pdf = descargar_pdf(pdf_url, categoria_nombre)
             print(f"✅ PDF descargado: {ruta_pdf}")
         except TimeoutException:
             pdf_url = None
@@ -110,24 +126,32 @@ def procesar_ofertas(categoria_url, categoria_nombre):
         time.sleep(2)
 
 def main():
+    categorias = ["Supermercados", "Combustible", "Farmacias"]
+
     try:
         # 1️⃣ Entrar a la página de categorías
         categorias_url = f"{BASE_URL}/beneficios/categorias/1/"
         driver.get(categorias_url)
         time.sleep(2)
 
-        # 2️⃣ Buscar dinámicamente el enlace de "Supermercados"
-        animar("🛒 Buscando etiqueta 'Supermercados'")
-        etiqueta = wait.until(EC.presence_of_element_located((By.LINK_TEXT, "Supermercados")))
-        categoria_nombre = "Supermercados"
-        categoria_url = etiqueta.get_attribute("href")
-        print(f"🌐 URL dinámica detectada: {categoria_url}")
+        for categoria_nombre in categorias:
+            try:
+                animar(f"🔍 Buscando etiqueta '{categoria_nombre}'")
+                
+                # 2️⃣ Buscar dinámicamente el enlace de la categoría
+                etiqueta = wait.until(EC.presence_of_element_located((By.LINK_TEXT, categoria_nombre)))
+                categoria_url = etiqueta.get_attribute("href")
+                print(f"🌐 URL dinámica detectada para {categoria_nombre}: {categoria_url}")
 
-        # 3️⃣ Procesar todas las ofertas visibles de esa etiqueta
-        procesar_ofertas(categoria_url, categoria_nombre)
+                # 3️⃣ Procesar todas las ofertas visibles de esa categoría
+                procesar_ofertas(categoria_url, categoria_nombre)
+
+            except Exception as e:
+                print(f"❌ No se pudo procesar la categoría '{categoria_nombre}': {e}")
 
     except Exception as e:
-        print(f"❌ Error inesperado: {e}")
+        print(f"❌ Error inesperado en la carga de la página de categorías: {e}")
+
     finally:
         print("\n⏳ Cerrando navegador en 3 segundos...")
         time.sleep(3)
