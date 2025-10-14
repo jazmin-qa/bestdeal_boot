@@ -10,6 +10,7 @@ from pathlib import Path
 from PyPDF2 import PdfReader
 import threading
 import  mysql.connector
+import unicodedata
 import time
 
 # Configuración de la base de datos
@@ -26,45 +27,76 @@ def insert_pdf_mysql(conn, record):
     try:
         cur = conn.cursor()
 
-        # --- Limpiar fechas: convertir '' o valores inválidos a None ---
+        # --- Limpiar fechas ---
         def clean_date(val):
             if not val or str(val).strip() in ["", "None", "null", "0000-00-00"]:
                 return None
-            return val  # Asumimos formato YYYY-MM-DD ya validado antes
+            return val
 
         valid_from = clean_date(record.get("valid_from"))
         valid_to = clean_date(record.get("valid_to"))
+
+        # --- DEBUG: imprimir tipos y contenido de cada campo ---
+        debug_fields = {
+            "valid_to": valid_to,
+            "valid_from": valid_from,
+            "terms_raw": record.get("terms_raw"),
+            "terms_conditions": record.get("terms_conditions"),
+            "source_file": record.get("source_file"),
+            "bank_name": record.get("bank_name"),
+            "payment_methods": record.get("payment_methods"),
+            "offer_url": record.get("offer_url"),
+            "offer_day": record.get("offer_day"),
+            "merchant_name": record.get("merchant_name"),
+            "merchant_logo_url": record.get("merchant_logo_url"),
+            "merchant_logo_downloaded": record.get("merchant_logo_downloaded"),
+            "merchant_location": record.get("merchant_location"),
+            "merchant_address": record.get("merchant_address"),
+            "details": record.get("details"),
+            "category_name": record.get("category_name"),
+            "card_brand": record.get("card_brand"),
+            "benefic": record.get("benefic"),
+            "ai_response": record.get("ai_response")
+        }
+
+        print(f"\n--- DEBUG INSERT {record.get('source_file','unknown')} ---")
+        for k, v in debug_fields.items():
+            print(f"{k}: {v} ({type(v)})")
+        print("--- FIN DEBUG ---\n")
 
         # --- Ejecutar INSERT ---
         cur.execute("""
             INSERT INTO web_offers (
                 valid_to, valid_from, terms_raw, terms_conditions, source_file,
-                source, payment_methods, offer_url, offer_day, merchant_name,
+                source, bank_name, payment_methods, offer_url, offer_day, merchant_name,
                 merchant_logo_url, merchant_logo_downloaded, merchant_location,
                 merchant_address, details, category_name, card_brand, benefit,
                 ai_response
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
-            valid_to,
-            valid_from,
-            record.get("raw_text_snippet", ""),
-            record.get("terms_conditions", ""),
-            record.get("archivo", ""),
-            record.get("source", "PDF"),
-            record.get("metodo_pago", ""),
-            record.get("url", ""),
-            record.get("offer_day", ""),
-            record.get("merchant", ""),
-            record.get("merchant_logo_url", ""),
+            safe_str(valid_to),
+            safe_str(valid_from),
+            safe_str(record.get("terms_raw")),
+            safe_str(record.get("terms_conditions")),
+            safe_str(record.get("source_file")),
+            "PDF",  # <-- source fijo
+            safe_str(record.get("bank_name")),
+            safe_str(record.get("payment_methods")),
+            safe_str(record.get("offer_url")),
+            safe_str(record.get("offer_day")),
+            safe_str(record.get("merchant_name")),
+            safe_str(record.get("merchant_logo_url")),
             int(record.get("merchant_logo_downloaded", 0) or 0),
-            record.get("location", ""),
-            record.get("address", ""),
-            record.get("details", ""),
-            record.get("categoria", ""),
-            record.get("marca_tarjeta", ""),
-            record.get("benefic", ""),
-            record.get("gemini_response", "")
+            safe_str(record.get("merchant_location")),
+            safe_str(record.get("merchant_address")),
+            safe_str(record.get("details")),
+            safe_str(record.get("category_name")),
+            safe_str(record.get("card_brand")),
+            safe_str(record.get("benefic")),
+            safe_str(record.get("ai_response"))
         ))
+
+
         conn.commit()
 
     except mysql.connector.Error as e:
@@ -180,9 +212,29 @@ Texto del PDF:
         # Eliminar envoltorios tipo ```json ... ```
         content = re.sub(r"^```(?:json)?\s*", "", content)
         content = re.sub(r"\s*```$", "", content)
+        # Intentar extraer un JSON puro incluso si Gemini devuelve texto extra
+        log_event(f"📄 {pdf_file} - Respuesta Gemini (raw):\n{content}\n{'-'*80}")
+        # Buscar el primer bloque JSON que parezca una lista/objeto
+        m = re.search(r"(\[\s*\{.*\}\s*\])", content, re.S)
+        if m:
+            content_clean = m.group(1)
+        else:
+            # Fallback: buscar desde el primer '[' hasta el último ']' si existe
+            start = content.find('[')
+            end = content.rfind(']')
+            if start != -1 and end != -1 and end > start:
+                content_clean = content[start:end+1]
+            else:
+                content_clean = content
 
-        log_event(f"📄 {pdf_file} - Respuesta Gemini:\n{content}\n{'-'*80}")
-        data = json.loads(content)
+        # Eliminar comas finales malformadas antes del cierre de listas/objetos
+        content_clean = re.sub(r",\s*\](?!\])", "]", content_clean)
+        try:
+            data = json.loads(content_clean)
+        except json.JSONDecodeError:
+            # Registro del intento fallido y fallback a lista vacía
+            log_event(f"⚠️ {pdf_file} - No se pudo decodificar JSON salvado de Gemini. Contenido parcial:\n{content_clean}")
+            data = []
     except json.JSONDecodeError:
         log_event(f"⚠️ {pdf_file} - JSON inválido. No se pudo decodificar respuesta de Gemini.")
         data = []
@@ -412,8 +464,6 @@ def parse_line_preserve_merchant(line, current_city=None):
 
 #Extraer información con camelot    
 
-
-
 def extract_addresses_with_camelot(pdf_path):
     """
     Extrae direcciones de TODAS las páginas del PDF usando únicamente Camelot.
@@ -502,12 +552,15 @@ def extract_addresses_with_camelot(pdf_path):
         return []
 
 # Función para normalizar dias de oferta
+
+
 def normalize_offer_day(day_value):
-    """Convierte 'Todos los días' en la lista completa de días."""
     if not isinstance(day_value, str):
         return day_value
     text = day_value.strip().lower()
-    if "todos los días" in text or "todos los dias" in text:
+    # quitar acentos
+    text = ''.join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
+    if "todos los dias" in text:
         return "Domingo,Lunes,Martes,Miercoles,Jueves,Viernes,Sabado"
     return day_value.strip().capitalize()
 
@@ -549,120 +602,194 @@ def clean_and_deduplicate_data(data_list):
     log_event(f"🧹 Limpieza completa: {before - after} duplicados estrictos eliminados, {after} registros finales.")
     return df.to_dict(orient="records")
 
+
 def process_pdf(pdf_path, category_name):
     log_event(f"🔍 Procesando PDF: {pdf_path.name}")
 
+    # Contar páginas primero
+    reader = PdfReader(str(pdf_path))
+    num_pages = len(reader.pages)
+    log_event(f"📘 {pdf_path.name}: {num_pages} páginas detectadas")
+
+    # Extraer texto base
     full_text = extract_text_from_pdf(pdf_path)
 
-    # 1️⃣ Si es Farmatotal, usar flujo especial
+    # 1️⃣ Caso especial Farmatotal
     if "Bases y Condiciones “Farmatotal”" in full_text or "Bases y Condiciones \"Farmatotal\"" in full_text:
         log_event(f"🏪 PDF detectado como Farmatotal → usando flujo especial")
         return process_farmatotal_pdf(pdf_path, category_name)
 
-    # 2️⃣ Flujo normal con Gemini
+    # 2️⃣ Caso especial Drugstore Asismed
+    if ("Bases y Condiciones “Drugstore Asismed”" in full_text) or ("Bases y Condiciones \"Drugstore Asismed\"" in full_text):
+        log_event(f"💊 PDF detectado como Drugstore Asismed → ajustando merchant_name dinámicamente según la location extraída")
+
+        general_data = call_gemini_api(category_name, full_text, pdf_path.name)
+
+        # Forzar merchant_name dinámico basado en location
+        for item in general_data:
+            location_val = (item.get("location") or "").strip()
+            if location_val:
+                item["merchant_name"] = f"Drugstore Asismed - {location_val}"
+            else:
+                item["merchant_name"] = "Drugstore Asismed"
+        return general_data
+
+    # 2️⃣ PDFs cortos (≤2 páginas)
+    if num_pages <= 2:
+        log_event(f"⚡ {pdf_path.name}: PDF corto (≤2 páginas) → llamando a call_gemini_api")
+        general_data = call_gemini_api(category_name, full_text, pdf_path.name)
+        log_event(f"✅ {pdf_path.name}: Datos obtenidos con Gemini ({len(general_data)} registros)")
+        return general_data
+
+    # 3️⃣ PDFs largos (>2 páginas)
+    log_event(f"📊 {pdf_path.name}: PDF largo (>2 páginas) → flujo extendido")
     text_without_section5 = extract_text_until_section5(pdf_path)
     general_data = call_gemini_api(category_name, text_without_section5, pdf_path.name)
+    log_event(f"✅ {pdf_path.name}: Datos generales obtenidos con Gemini ({len(general_data)} registros)")
 
-    # 3️⃣ Si PDF tiene >2 páginas, extraer direcciones con Camelot/pdfplumber
-    reader = PdfReader(str(pdf_path))
-    num_pages = len(reader.pages)
+    # Extraer direcciones con Camelot/pdfplumber
+    address_records = extract_addresses_with_camelot(pdf_path)
+    if address_records:
+        log_event(f"⚠️ {pdf_path.name}: Enviando {len(address_records)} direcciones a Gemini para corrección")
+        corrected_records = correct_addresses_with_gemini(address_records, pdf_path.name)
 
-    if num_pages > 2:
-        address_records = extract_addresses_with_camelot(pdf_path)
-        if address_records:
-            # 🔹 Enviar TODAS las direcciones a Gemini para revisión/corrección
-            log_event(f"⚠️ {pdf_path.name}: Enviando {len(address_records)} direcciones a Gemini para revisión")
-            corrected_records = correct_addresses_with_gemini(address_records, pdf_path.name)
-
-            # 🔹 Combinar datos con general_data usando las direcciones corregidas
-            merged_data = []
-            for addr in corrected_records:
-                for base in general_data:
-                    item = base.copy()
-                    item["merchant_name"] = addr.get("merchant_name", "")
-                    item["location"] = sanitize_location_value(addr.get('location'))
-                    item["address"] = addr.get('address', '')
-                    merged_data.append(item)
-            return merged_data
-        else:
-            return general_data
+        # Combinar datos generales con direcciones corregidas
+        merged_data = []
+        for addr in corrected_records:
+            for base in general_data:
+                item = base.copy()
+                item["merchant_name"] = addr.get("merchant_name", "")
+                item["location"] = sanitize_location_value(addr.get('location'))
+                item["address"] = addr.get('address', '')
+                merged_data.append(item)
+        log_event(f"📦 {pdf_path.name}: Datos combinados ({len(merged_data)} registros finales)")
+        return merged_data
     else:
+        log_event(f"⚠️ {pdf_path.name}: No se detectaron direcciones, devolviendo solo datos generales")
         return general_data
+
 
 def process_farmatotal_pdf(pdf_path, category_name):
     """
     Procesa PDF Farmatotal:
-    - Llama a Gemini una sola vez.
-    - Usa los registros devueltos por Gemini tal como vienen (si hay uno por local, se respetan).
-    - Si Gemini no trae location/address para un registro, se usa la extracción del PDF como fallback.
+    - Usa el merchant_name que devuelve Gemini, anteponiendo 'Farmatotal - ' (solo si no lo incluye).
+    - Si Gemini no devuelve merchant_name, asigna 'Farmatotal' por defecto.
+    - Registra en logs el merchant_name final y la dirección.
     """
     log_event(f"🏪 Procesando Farmatotal PDF: {pdf_path.name}")
 
-    # 1) Llamada a Gemini (una sola vez)
-    gemini_data = call_gemini_api(category_name, extract_text_from_pdf(pdf_path), pdf_path.name)
+    # 1️⃣ Obtener datos desde Gemini
+    full_text = extract_text_from_pdf(pdf_path)
+    gemini_data = call_gemini_api(category_name, full_text, pdf_path.name)
+
     if not gemini_data:
-        log_event(f"⚠️ {pdf_path.name}: Gemini no devolvió datos.")
-        return []
+        log_event(f"⚠️ {pdf_path.name}: Gemini no devolvió datos, usando fallback de direcciones.")
+        farmatotal_addresses = extract_farmatotal_addresses(pdf_path)
+        fallback_records = []
 
-    # 2) Extraer direcciones desde PDF (fallback)
-    farmatotal_addresses = extract_farmatotal_addresses(pdf_path)  # lista de [location, direccion]
+        for _, addr_pdf in farmatotal_addresses:
+            rec = {
+                "category_name": category_name,
+                "bank_name": BANK_NAME,
+                "valid_from": None,
+                "valid_to": None,
+                "offer_day": None,
+                "benefit": [],
+                "payment_method": None,
+                "card_brand": None,
+                "terms_raw": "",
+                "terms_conditions": "",
+                "merchant_name": "Farmatotal",
+                "location": "Farmatotal",
+                "address": addr_pdf or "",
+                "pdf_file": pdf_path.name
+            }
+            fallback_records.append(rec)
+            log_event(f"📍 Registro creado: {rec['merchant_name']} | Dirección: {rec['address']}")
 
+        log_event(f"✅ {pdf_path.name}: {len(fallback_records)} registros creados con fallback.")
+        return fallback_records
+
+    # 2️⃣ Extraer direcciones desde PDF
+    farmatotal_addresses = extract_farmatotal_addresses(pdf_path)
     final_records = []
 
-    # 3) Si Gemini devolvió múltiples registros, preferimos respetar cada uno tal cual venga
-    if len(gemini_data) > 1:
-        # Si hay igual cantidad de gemini_data y direcciones extraídas, las podemos emparejar por índice
-        if len(gemini_data) == len(farmatotal_addresses):
-            for i, gem_item in enumerate(gemini_data):
-                item = gem_item.copy()
-                loc_pdf, addr_pdf = farmatotal_addresses[i]
-                # Preferir lo que trae Gemini si existe, si no usar PDF
-                item["location"] = item.get("location") or (loc_pdf or "")
-                item["address"] = item.get("address") or (addr_pdf or "")
-                final_records.append(item)
-        else:
-            # Si no coinciden cantidades, preferimos respetar lo que trae Gemini para cada registro.
-            # Para cada registro de Gemini usamos sus location/address si existen,
-            # en caso contrario intentamos sacar uno de la lista de PDF disponible (pop).
-            pdf_iter = farmatotal_addresses.copy()
-            for gem_item in gemini_data:
-                item = gem_item.copy()
-                if not item.get("location") or not item.get("address"):
-                    # tomar próximo fallback del PDF si existe
-                    if pdf_iter:
-                        loc_pdf, addr_pdf = pdf_iter.pop(0)
-                        item["location"] = item.get("location") or (loc_pdf or "")
-                        item["address"] = item.get("address") or (addr_pdf or "")
-                final_records.append(item)
+    # 3️⃣ Construir registros finales
+    for i, gem_item in enumerate(gemini_data):
+        item = gem_item.copy()
+        _, addr_pdf = (
+            farmatotal_addresses[i] if i < len(farmatotal_addresses) else ("", "")
+        )
 
-    else:
-        # 4) Caso común: Gemini devolvió UN solo registro (plantilla general)
+        # Tomar merchant_name devuelto por Gemini o usar "Farmatotal"
+        gem_merchant = (item.get("merchant_name") or "").strip()
+        if gem_merchant:
+            # Evitar duplicar "Farmatotal - Farmatotal"
+            if "farmatotal" in gem_merchant.lower():
+                sucursal_final = gem_merchant
+            else:
+                sucursal_final = f"Farmatotal - {gem_merchant}"
+        else:
+            sucursal_final = "Farmatotal"
+
+        # Crear registro formateado
+        item["merchant_name"] = sucursal_final
+        item["location"] = item.get("location") or "Farmatotal"
+        item["address"] = item.get("address") or (addr_pdf or "")
+
+        final_records.append(item)
+        log_event(f"📍 Registro creado: {item['merchant_name']} | Dirección: {item['address']}")
+
+    # 4️⃣ Si Gemini devolvió un solo bloque pero hay múltiples direcciones
+    if len(gemini_data) == 1 and len(farmatotal_addresses) > 1:
         base = gemini_data[0]
-        if not farmatotal_addresses:
-            # No hay direcciones extraídas: devolver la plantilla tal cual
-            final_records.append(base)
-        else:
-            # Por cada dirección extraída, crear un registro que respete los valores de Gemini
-            for loc_pdf, addr_pdf in farmatotal_addresses:
-                item = base.copy()
-                # merchant_name: si Gemini ya trae nombre lo mantenemos, sino lo construimos
-                item["merchant_name"] = item.get("merchant_name") or ("Farmatotal - " + (loc_pdf or ""))
-                # location: preferir lo que trae Gemini; si está vacío usar loc_pdf (si es válido)
-                item["location"] = item.get("location") or (loc_pdf or "")
-                # address: preferir lo que trae Gemini; si está vacío usar addr_pdf (si es válido)
-                addr_pdf = (addr_pdf or "").strip()
-                if item.get("address") and len(str(item.get("address")).strip()) > 0:
-                    # mantener address de Gemini
-                    item["address"] = item["address"]
-                elif addr_pdf and len(addr_pdf) > 5:
-                    item["address"] = addr_pdf
+        final_records = []
+        for _, addr_pdf in farmatotal_addresses:
+            item = base.copy()
+            gem_merchant = (item.get("merchant_name") or "").strip()
+            if gem_merchant:
+                if "farmatotal" in gem_merchant.lower():
+                    sucursal_final = gem_merchant
                 else:
-                    # fallback vacío o mantener lo que haya
-                    item["address"] = item.get("address", "")
-                final_records.append(item)
+                    sucursal_final = f"Farmatotal - {gem_merchant}"
+            else:
+                sucursal_final = "Farmatotal"
 
-    log_event(f"✅ {pdf_path.name}: {len(final_records)} registros finales combinados (Farmatotal)")
+            item["merchant_name"] = sucursal_final
+            item["location"] = item.get("location") or "Farmatotal"
+            item["address"] = item.get("address") or (addr_pdf or "")
+            final_records.append(item)
+            log_event(f"📍 Registro creado: {item['merchant_name']} | Dirección: {item['address']}")
+
+    log_event(f"✅ {pdf_path.name}: {len(final_records)} registros finales combinados (Farmatotal).")
     return final_records
+
+
+def detect_farmatotal_branch(pdf_path):
+    """
+    Detecta la sucursal de Farmatotal desde el texto del PDF.
+    Busca palabras como 'Sucursal Central', 'Farmatotal San Lorenzo', etc.
+    """
+    try:
+        text = extract_text_from_pdf(pdf_path)
+        # Buscar patrones típicos de sucursal y devolver solo si parecen nombres (no direcciones)
+        match = re.search(r"Sucursal\s+([A-Za-zÁÉÍÓÚÑáéíóú\s]+)", text)
+        if match:
+            cand = match.group(1).strip()
+            # Rechazar si parece una dirección (contiene tokens de calle, números o 'Avda', 'Km')
+            if not is_likely_address(cand):
+                return cand
+
+        # Alternativamente, buscar "Farmatotal [Sucursal]" y validar igualmente
+        match = re.search(r"Farmatotal\s+([A-Za-zÁÉÍÓÚÑáéíóú\s]+)", text)
+        if match:
+            cand = match.group(1).strip()
+            if not is_likely_address(cand):
+                return cand
+    except Exception:
+        pass
+    return None
+
 
 
 def normalize_benefits(benefit_field):
@@ -773,8 +900,8 @@ def extract_farmatotal_addresses(pdf_path):
                 lines = [l.strip() for l in text.split("\n") if l.strip()]
 
                 for line in lines:
-                    # 🔹 Saltar encabezados o textos no relevantes
-                    if re.search(r"(?i)sucursal|direcci[oó]n|farmatotal|bases|condiciones", line):
+                    # 🔹 Saltar encabezados o textos no relevantes (secciones)
+                    if re.search(r"(?i)\b(vigencia|beneficio|beneficios|mecanic|mecánica|sucursal|direcci[oó]n|farmatotal|bases|condiciones)\b", line):
                         continue
 
                     location = ""
@@ -783,35 +910,49 @@ def extract_farmatotal_addresses(pdf_path):
                     # 1️⃣ Línea numerada tipo "1) Asunción R.I. 2 Ytororo esq..."
                     match_num = re.match(r"^\s*\d+\s*[.)-]?\s*(.+?)\s{1,}(.+)$", line)
                     if match_num:
-                        location = match_num.group(1).strip()
-                        direccion = direccion.strip()
-                        results.append([location, direccion])
-                        continue
+                        candidate_loc = match_num.group(1).strip()
+                        candidate_addr = match_num.group(2).strip()
+                        # Validar que el candidato de sucursal no sea un token inválido
+                        if candidate_loc and len(re.sub(r"[^A-Za-zÁÉÍÓÚÑáéíóú ]", "", candidate_loc)) >= 2:
+                            location = candidate_loc
+                            direccion = candidate_addr
+                            results.append([location, direccion])
+                            continue
 
-                    # 2️⃣ Línea con separadores comunes: "|", "-", "–", ";"
+                    # 2️⃣ Línea con separadores comunes: "|", " - ", " – ", ";"
                     if "|" in line or " – " in line or " - " in line or ";" in line:
                         parts = re.split(r"[|–\-;]", line)
                         parts = [p.strip() for p in parts if p.strip()]
                         if len(parts) >= 2:
-                            # Asumimos las dos primeras partes son Location y Dirección
                             location = parts[0]
-                            direccion = direccion.strip()
-                            results.append([location, direccion])
-                        continue
+                            direccion = " ".join(parts[1:]).strip()
+                            # Validar location
+                            if location and len(re.sub(r"[^A-Za-zÁÉÍÓÚÑáéíóú ]", "", location)) >= 2:
+                                results.append([location, direccion])
+                                continue
 
-                    # 3️⃣ Si parece una dirección suelta (sin número)
+                    # 3️⃣ Si la línea parece una dirección completa, añadir con location vacío
                     if is_likely_address(line):
                         results.append(["", line.strip()])
                         continue
 
-        # 🔹 Eliminar duplicados
+        # 🔹 Eliminar duplicados y filtrar entradas basura
         unique_results = []
         seen = set()
         for loc, addr in results:
-            key = (loc.lower().strip(), addr.lower().strip())
-            if key not in seen and addr:
+            # Normalizar
+            loc_norm = (loc or "").strip()
+            addr_norm = (addr or "").strip()
+            # Filtrar si address está vacío
+            if not addr_norm:
+                continue
+            # Excluir filas donde loc sea claramente un token residual
+            if loc_norm and re.match(r'^[^A-Za-z0-9]{1,3}$', loc_norm):
+                loc_norm = ""
+            key = (loc_norm.lower(), addr_norm.lower())
+            if key not in seen:
                 seen.add(key)
-                unique_results.append([loc, addr])
+                unique_results.append([loc_norm, addr_norm])
 
         log_event(f"✅ {pdf_path.name}: {len(unique_results)} direcciones extraídas (Farmatotal)")
         return unique_results
@@ -825,7 +966,8 @@ def sanitize_location_value(loc):
     if not loc or not isinstance(loc, str):
         return None
 
-    forbidden_words = ["Vigencia", "Condiciones", "Mecánica", "Locales", "Beneficio"]
+    # Palabras que no deben considerarse como location
+    forbidden_words = ["Vigencia", "Condiciones", "Mecánica", "Locales", "Beneficio", "Dirección"]
     for word in forbidden_words:
         if word.lower() in loc.lower():
             return None
@@ -893,18 +1035,43 @@ def save_to_csv(data_list):
         encoding="utf-8-sig"
     )
 
-
+def safe_str(val):
+    if isinstance(val, list):
+        return " , ".join(map(str, val))  # Separa las viñetas con '•'
+    elif val is None:
+        return ""
+    else:
+        return str(val)
+    
+def clean_terms(text):
+    if not text:
+        return ""
+    # Quitar viñetas
+    text = re.sub(r"[•\-\*]", "", text)
+    # Normalizar espacios múltiples a uno solo
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+"""
 def main():
     threading.Thread(target=log_periodic_processing, daemon=True).start()
 
     all_data = []
     errores_gemini = set()
 
+    # Conexión a MySQL (una sola vez)
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+    except mysql.connector.Error as e:
+        log_event(f"❌ No se pudo conectar a MySQL: {e}")
+        return
+
     # Leer CSV de PDFs
     df_pdfs = pd.read_csv(PDFS_CSV)
     for idx, row in df_pdfs.iterrows():
         pdf_path_str = str(row.get("Ruta PDF")).strip()
-        category_name = str(row.get("Categoria", "SinCategoria")).strip() or "SinCategoria"
+        category_name_csv = str(row.get("Categoria", "SinCategoria")).strip() or "SinCategoria"
+        offer_url = str(row.get("Link PDF", "") or "").strip()
+        bank_name = str(row.get("Banco", "PDF")).strip()
 
         if not pdf_path_str or pdf_path_str.lower() == "nan":
             log_event(f"⚠️ Fila {idx+1}: sin ruta PDF válida.")
@@ -916,15 +1083,47 @@ def main():
             continue
 
         # Procesar PDF
-        records = process_pdf(pdf_path, category_name)
+        records = process_pdf(pdf_path, category_name_csv)
         if records:
             all_data.extend(records)
             log_event(f"✅ PDF procesado: {pdf_path.name} ({len(records)} registros)")
+
+            # Transformar e insertar en MySQL
+            for rec in records:
+                # Determinar merchant_name final: preferir nombre limpio provisto por rec,
+                # si parece válido; sino construir 'Farmatotal - {location}' evitando 'Dirección'.
+                raw_merchant = rec.get("merchant_name", "") or ""
+                if raw_merchant and isinstance(raw_merchant, str) and raw_merchant.strip() and not is_likely_address(raw_merchant) and raw_merchant.strip().lower() not in ["farmatotal", "dirección"]:
+                    final_merchant_name = clean_merchant_name(raw_merchant)
+               
+                insert_record = {
+                    "category_name": category_name_csv,
+                    "bank_name": rec.get("bank_name", bank_name),
+                    "valid_from": rec.get("valid_from"),
+                    "valid_to": rec.get("valid_to"),
+                    "offer_day": normalize_offer_day(rec.get("offer_day", "")),
+                    "benefic": rec.get("benefit", ""),
+                    "payment_methods": rec.get("payment_method", ""),
+                    "card_brand": rec.get("card_brand", ""),
+                    "terms_raw": rec.get("terms_raw", ""),
+                    "terms_conditions": clean_terms(rec.get("terms_conditions", "")),
+                    "merchant_name": final_merchant_name,
+                    "merchant_location": rec.get("location", ""),
+                    "merchant_address": rec.get("address", ""),
+                    "source_file": rec.get("pdf_file", pdf_path.name),
+                    "ai_response": rec.get("gemini_response", ""),
+                    "offer_url": offer_url  # <-- Aquí guardamos el link del CSV
+                }
+
+                try:
+                    insert_pdf_mysql(conn, insert_record)
+                except Exception as e:
+                    log_event(f"⚠ Error insertando {pdf_path.name} en MySQL: {e}")
         else:
             errores_gemini.add(pdf_path.name)
             log_event(f"⚠️ No se extrajeron registros de {pdf_path.name}")
 
-    # Guardar resultados de la primera pasada
+    # Guardar resultados a CSV (opcional)
     if all_data:
         all_data = clean_and_deduplicate_data(all_data)
         save_to_csv(all_data)
@@ -935,7 +1134,7 @@ def main():
     # ======================================
     if errores_gemini:
         log_event("🔁 Reintentando PDFs con error...")
-        time.sleep(5)  # Pausa opcional entre llamadas
+        time.sleep(5)
 
         reintento_data = []
         for pdf_name in sorted(list(errores_gemini)):
@@ -945,21 +1144,106 @@ def main():
                 continue
 
             log_event(f"🔄 Reintentando: {pdf_name}")
-            # Usar categoría del directorio padre como fallback
             category_name = pdf_path.parent.name
             records = process_pdf(pdf_path, category_name)
             if records:
                 reintento_data.extend(records)
                 log_event(f"✅ Reintento exitoso: {pdf_name} ({len(records)} registros)")
+
+                for rec in records:
+                    # para reintentos aplicamos la misma lógica de merchant_name
+                    raw_merchant = rec.get("merchant_name", "") or ""
+                    if raw_merchant and isinstance(raw_merchant, str) and raw_merchant.strip() and not is_likely_address(raw_merchant) and raw_merchant.strip().lower() not in ["farmatotal", "dirección"]:
+                        final_merchant_name = clean_merchant_name(raw_merchant)
+                    
+                    insert_record = {
+                        "category_name": rec.get("category_name", category_name),
+                        "bank_name": rec.get("bank_name", bank_name),
+                        "valid_from": rec.get("valid_from"),
+                        "valid_to": rec.get("valid_to"),
+                        "offer_day": normalize_offer_day(rec.get("offer_day", "")),
+                        "benefic": rec.get("benefit", ""),
+                        "payment_methods": rec.get("payment_method", ""),
+                        "card_brand": rec.get("card_brand", ""),
+                        "terms_raw": rec.get("terms_raw", ""),
+                        "terms_conditions": clean_terms(rec.get("terms_conditions", "")),
+                        "merchant_name": final_merchant_name,
+                        "merchant_location": rec.get("location", ""),
+                        "merchant_address": rec.get("address", ""),
+                        "source_file": rec.get("pdf_file", pdf_path.name),
+                        "ai_response": rec.get("gemini_response", "")
+                    }
+                    try:
+                        insert_pdf_mysql(conn, insert_record)
+                    except Exception as e:
+                        log_event(f"⚠ Error insertando {pdf_name} en MySQL: {e}")
             else:
                 log_event(f"❌ Reintento fallido: {pdf_name}")
 
-        # Guardar resultados de los reintentos
+        # Guardar reintentos a CSV (opcional)
         if reintento_data:
             reintento_data = clean_and_deduplicate_data(reintento_data)
             save_to_csv(reintento_data)
             log_event(f"💾 {len(reintento_data)} registros de reintentos guardados en {OUTPUT_CSV}")
 
+    conn.close()
+    log_event("✅ Proceso finalizado correctamente.")
+"""
+def insert_single_pdf():
+    pdf_path = Path('data_gnbpy/Farmacias/4270_byc-farmatotal-06-2025.pdf')
+    if not pdf_path.exists():
+        log_event(f"❌ PDF no encontrado: {pdf_path}")
+        return
+
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+    except mysql.connector.Error as e:
+        log_event(f"❌ No se pudo conectar a MySQL: {e}")
+        return
+
+    # Procesar el PDF
+    records = process_pdf(pdf_path, category_name="Farmacias")
+    if not records:
+        log_event(f"⚠️ No se extrajeron registros de {pdf_path.name}")
+        conn.close()
+        return
+
+    for rec in records:
+        raw_merchant = rec.get("merchant_name", "") or ""
+        if raw_merchant and isinstance(raw_merchant, str) and raw_merchant.strip() and not is_likely_address(raw_merchant):
+            final_merchant_name = clean_merchant_name(raw_merchant)
+        else:
+            final_merchant_name = "Farmatotal"
+
+        insert_record = {
+            "category_name": rec.get("category_name", "Farmacias"),
+            "bank_name": rec.get("bank_name", "PDF"),
+            "valid_from": rec.get("valid_from"),
+            "valid_to": rec.get("valid_to"),
+            "offer_day": normalize_offer_day(rec.get("offer_day", "")),
+            "benefic": rec.get("benefit", ""),
+            "payment_methods": rec.get("payment_method", ""),
+            "card_brand": rec.get("card_brand", ""),
+            "terms_raw": rec.get("terms_raw", ""),
+            "terms_conditions": clean_terms(rec.get("terms_conditions", "")),
+            "merchant_name": final_merchant_name,
+            "merchant_location": rec.get("location", ""),
+            "merchant_address": rec.get("address", ""),
+            "source_file": rec.get("pdf_file", pdf_path.name),
+            "ai_response": rec.get("gemini_response", ""),
+            "offer_url": ""  # Si quieres, puedes agregar link específico
+        }
+
+        try:
+            insert_pdf_mysql(conn, insert_record)
+            log_event(f"✅ Registro insertado: {final_merchant_name}")
+        except Exception as e:
+            log_event(f"⚠ Error insertando en MySQL: {e}")
+
+    conn.close()
+    log_event(f"✅ Proceso completado para {pdf_path.name}")
+
 
 if __name__ == "__main__":
-    main()
+    #main()
+    insert_single_pdf()

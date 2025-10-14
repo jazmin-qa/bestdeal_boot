@@ -1,13 +1,14 @@
 # Ignorar todo
 *
 
-# Permitir solo estos dos archivos
+# Permitir solo estos archivos
 !ocr_familiar.py
 !scr_familiar.py
 !.gitignore
 !ocr_gnbpy.py
 !scr_gnbpy.py
-
+!scr_continental.py
+!ocr_continental.py
 
 # Ignorar carpetas comunes
 __pycache__/
