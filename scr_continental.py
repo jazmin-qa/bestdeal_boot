@@ -3,6 +3,7 @@ import time
 import re
 import csv
 import json
+import html
 import threading
 import pandas as pd
 import google.generativeai as genai
@@ -19,6 +20,100 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 import requests
 from urllib.parse import urljoin
+import mysql.connector
+
+
+
+DB_CONFIG = {
+    "host" : "192.168.0.11",
+    "user" : "root",
+    "password" : "Crite.2019",
+    "database" : "best_deal"
+}
+
+def insert_pdf_mysql(conn, record):
+    """Inserta un registro en la tabla 'web_offers', manejando fechas vacías y evitando errores."""
+    try:
+        cur = conn.cursor()
+
+        # --- Limpiar fechas ---
+        def clean_date(val):
+            if not val or str(val).strip() in ["", "None", "null", "0000-00-00"]:
+                return None
+            return val
+
+        valid_from = clean_date(record.get("valid_from"))
+        valid_to = clean_date(record.get("valid_to"))
+
+        # --- DEBUG: imprimir tipos y contenido de cada campo ---
+        debug_fields = {
+            "valid_to": valid_to,
+            "valid_from": valid_from,
+            "terms_raw": record.get("terms_raw"),
+            "terms_conditions": record.get("terms_conditions"),
+            "source_file": record.get("source_file"),
+            "bank_name": record.get("bank_name"),
+            "payment_methods": record.get("payment_methods"),
+            "offer_url": record.get("offer_url"),
+            "offer_day": record.get("offer_day"),
+            "merchant_name": record.get("merchant_name"),
+            "merchant_logo_url": record.get("merchant_logo_url"),
+            "merchant_logo_downloaded": record.get("merchant_logo_downloaded"),
+            "merchant_location": record.get("merchant_location"),
+            "merchant_address": record.get("merchant_address"),
+            "details": record.get("details"),
+            "category_name": record.get("category_name"),
+            "card_brand": record.get("card_brand"),
+            "benefic": record.get("benefic"),
+            "ai_response": record.get("ai_response")
+        }
+
+        print(f"\n--- DEBUG INSERT {record.get('source_file','unknown')} ---")
+        for k, v in debug_fields.items():
+            print(f"{k}: {v} ({type(v)})")
+        print("--- FIN DEBUG ---\n")
+
+        # --- Ejecutar INSERT ---
+        cur.execute("""
+            INSERT INTO web_offers (
+                valid_to, valid_from, terms_raw, terms_conditions, source_file,
+                source, bank_name, payment_methods, offer_url, offer_day, merchant_name,
+                merchant_logo_url, merchant_logo_downloaded, merchant_location,
+                merchant_address, details, category_name, card_brand, benefit,
+                ai_response
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            valid_to,
+            valid_from,
+            record.get("terms_raw"),
+            record.get("terms_conditions"),
+            record.get("source_file"),
+            "PDF",  # <-- source fijo
+            record.get("bank_name"),
+            record.get("payment_methods"),
+            record.get("offer_url"),
+            record.get("offer_day"),
+            record.get("merchant_name"),
+            record.get("merchant_logo_url"),
+            int(record.get("merchant_logo_downloaded", 0) or 0),
+            record.get("merchant_location"),
+            record.get("merchant_address"),
+            record.get("details"),
+            record.get("category_name"),
+            record.get("card_brand"),
+            record.get("benefic"),
+            record.get("ai_response")
+        ))
+
+
+        conn.commit()
+
+    except mysql.connector.Error as e:
+        print(f"⚠ Error insertando en MySQL: {e}")
+        conn.rollback()
+    finally:
+        cur.close()
+
 
 # --- Configuración ---
 URL = "https://www.bancontinental.com.py/#/club-continental/comercios"
@@ -34,13 +129,50 @@ os.makedirs(LOGOS_DIR, exist_ok=True)
 
 LOG_FILE = DATA_DIR / "procesamiento_continental.log"
 RUBROS_OBJETIVO = {
-    "Estaciones de Servicios": ["Puma Energy"]
+    "Supermercados": ["Casa Grutter"]
 }
+
 
 
 def safe_filename(name):
     """Genera un nombre seguro para archivo a partir del nombre del comercio."""    
     return re.sub(r"[^\w\d-]", "_", name.strip().lower())
+
+
+
+
+def limpiar_para_json(texto: str) -> str:
+    """
+    Limpia un string para evitar que rompa JSON:
+    - Escapa comillas dobles internas.
+    - Elimina caracteres invisibles y Unicode problemáticos.
+    - Sustituye saltos de línea por espacios.
+    - Des-escapa entidades HTML problemáticas.
+    """
+
+    if not texto:
+        return ""
+
+    # 1️⃣ Reemplazar comillas dobles internas por comillas simples
+    texto = texto.replace('""', '"')  # dobles dobles
+    texto = texto.replace('"', "'")
+
+    # 2️⃣ Eliminar caracteres invisibles (como \u200b, \u200c, etc.)
+    texto = re.sub(r'[\u200b-\u200f\u202a-\u202e]', '', texto)
+
+    # 3️⃣ Reemplazar saltos de línea por espacio
+    texto = re.sub(r'[\r\n]+', ' ', texto)
+
+    # 4️⃣ Reducir múltiples espacios a uno solo
+    texto = re.sub(r'\s{2,}', ' ', texto)
+
+    # 5️⃣ Decodificar entidades HTML (&nbsp;, &quot;, etc.)
+    texto = html.unescape(texto)
+
+    # 6️⃣ Recortar espacios al inicio y fin
+    texto = texto.strip()
+
+    return texto
 
 # --- Gemini ---
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
@@ -134,13 +266,25 @@ def desnormalizar_sucursales(entry, modal_html):
                 registro["location"] = current_location
                 registro["address"] = li.get_text(strip=True)
                 # Puedes concatenar el merchant_name con la ciudad si quieres
-                registro["merchant_name"] = f"{entry.get('merchant_name','')} - {current_location}"
+                nombre = limpiar_nombre_merchant(entry.get("merchant_name", "").strip())
+                ciudad = current_location.strip() if current_location else entry.get("location", "").strip()
+                registro["merchant_name"] = f"{nombre} - {ciudad}".strip(" -")
+                log_event(f"📝 Merchant generado: {registro['merchant_name']}")
+
                 registros.append(registro)
 
     # Si no se encontró ninguna dirección, dejar el registro original
     if not registros:
         registros.append(entry)
     return registros
+
+
+def limpiar_nombre_merchant(nombre):
+    """Limpia el nombre del comercio quitando frases como 'Vigente hasta...'."""
+    if not nombre:
+        return ""
+    limpio = re.sub(r"-?\s*vigente\s+hasta.*", "", nombre, flags=re.IGNORECASE)
+    return limpio.strip(" -–—")
 
 
 def close_modal(driver):
@@ -203,21 +347,23 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
             "Ej: 35% de descuento",
             "Ej: 3 cuotas sin intereses"
         ],
-        "payment_method": "Ej: Tarjetas de Crédito Continental",
-        "card_brand": "Ej: Dinelco, Clásica, Oro, Black, Infinite",
+        "payment_method": "Ej: Tarjeta de Crédito",
+        "card_brand": "Ej: Clásica, Oro, Black, Infinite",
         "terms_raw": "Texto del bloque 'Límites de compras' o 'Mecánica'",
         "terms_conditions": "Texto completo de las condiciones o restricciones",
-        "merchant_name": "Nombre del local adherido",
+        "merchant_name": "Nombre del local adherido (concatenado con la ciudad si existe, por ejemplo: 'Puma Energy - Asunción')",
         "location": "Ciudad o cabecera del listado (ASUNCIÓN, VILLARRICA, etc.)",
         "address": "Dirección textual del local adherido"
       }}
     ]
 
     ⚠️ REGLAS ESPECIALES:
+    - Si existe una ciudad o localidad identificable, concaténala al nombre del comercio en el campo merchant_name con el formato 'Nombre - Ciudad'.
+    - SI no hay ciudad o location, entonces dejar solo el nombre del comercio.
     - Si el texto contiene varios beneficios (por ejemplo: '20% los miércoles y 6 cuotas todos los días'),
       separa cada uno en un objeto JSON distinto.
     - Si el HTML contiene múltiples direcciones o localidades, genera un registro por cada dirección y ciudad.
-    - Identifica y lista todas las marcas de tarjetas mencionadas (Dinelco, Clásica, Oro, Black, Infinite, Privilege, Mastercard).
+    - Identifica y lista todas las marcas de tarjetas mencionadas (Clásica, Oro, Black, Infinite, Privilege, Mastercard).
     - Excluye marcas en frases como 'No participan las tarjetas Pre-Pagas, Gourmet Card ni Cabal'.
 
     Devuelve SOLO JSON válido, sin explicaciones ni texto adicional.
@@ -259,16 +405,40 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
     try:
         response = model.generate_content(prompt)
         text = response.text.strip()
-        json_clean = re.sub(r"```json|```", "", text).strip()
-
+        json_clean = (
+            text.replace("```json", "")
+                .replace("```", "")
+                .replace("\u200b", "")  # elimina caracteres invisibles
+                .strip()
+        )
         log_event("🧠 Respuesta literal de Gemini antes del parseo:")
         for linea in text.splitlines():
             log_event(f"    {linea}")
 
         # Parsear JSON
-        data = json.loads(json_clean)
-        if isinstance(data, dict):
-            data = [data]
+        try:
+                data = json.loads(json_clean)
+                if isinstance(data, dict):
+                    data = [data]
+        except Exception as e:
+            log_event(f"❌ Error parseando JSON de Gemini: {e}")
+            
+            # Intento de reparación si hay cortes o comillas faltantes
+            json_repair = json_clean
+            if not json_repair.strip().endswith("]"):
+                json_repair += "]"
+            if not json_repair.strip().startswith("["):
+                json_repair = "[" + json_repair
+
+            try:
+                data = json.loads(json_repair)
+                log_event("⚙️ JSON parcialmente reparado y cargado correctamente.")
+            except Exception as e2:
+                log_event(f"🔎 Texto recibido (inicio): {json_clean[:400]}")
+                log_event(f"❌ No se pudo reparar el JSON: {e2}")
+                return []
+
+
 
         enriched = []
         soup = BeautifulSoup(modal_html, "html.parser")
@@ -315,13 +485,35 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
             if not beneficios:
                 beneficios = entry.get("benefit", [])
 
-            # --- Detección de marcas ---
-            texto_completo = " ".join([
-                entry.get("terms_raw", ""),
-                entry.get("terms_conditions", ""),
-                " ".join(beneficios)
-            ])
-            card_brands = detectar_card_brands(texto_completo)
+            # --- FILTRAR beneficio prioritario (ej: 20%) ---
+            beneficio_prioritario = None
+            for b in beneficios:
+                if re.search(r"\b20%\b", b):
+                    beneficio_prioritario = b
+                    break
+            if beneficio_prioritario:
+                beneficios = [beneficio_prioritario]
+
+            # --- Detectar marcas solo si Gemini no trajo card_brand ---
+            # --- Manejo seguro del campo card_brand ---
+            card_brands_raw = entry.get("card_brand", "")
+            if isinstance(card_brands_raw, list):
+                card_brands = ", ".join(str(c).strip() for c in card_brands_raw if c)
+            elif isinstance(card_brands_raw, str):
+                card_brands = card_brands_raw.strip()
+            else:
+                card_brands = ""
+
+            # Si sigue vacío, intentar detectarlo automáticamente
+            texto_completo = ""
+            if not card_brands:
+                texto_completo = " ".join([
+                    entry.get("terms_raw", ""),
+                    entry.get("terms_conditions", ""),
+                    " ".join(beneficios)
+                ])
+                card_brands = detectar_card_brands(texto_completo)
+
 
             # Si hay varias combinaciones de beneficios con diferentes tarjetas
             if len(beneficios) > 1 and "," in card_brands:
@@ -341,7 +533,10 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
                         copia = entry.copy()
                         copia["benefit"] = beneficios
                         copia["card_brand"] = card_brands
-                        copia["merchant_name"] = f"{entry.get('merchant_name','')} - {block['location']}".strip(" -")
+                        nombre = limpiar_nombre_merchant(entry.get("merchant_name", "").strip())
+                        ciudad = block["location"].strip() if block.get("location") else entry.get("location", "").strip()
+                        copia["merchant_name"] = f"{nombre} - {ciudad}".strip(" -")
+                        log_event(f"📝 Merchant generado por Gemini: {copia['merchant_name']}")
                         copia["location"] = block["location"]
                         copia["address"] = addr
                         enriched.append(copia)
@@ -361,187 +556,7 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
     except Exception as e:
         logging.error(f"Error procesando con Gemini: {e}")
         return []
-"""
-def main():
-    global procesando_activo
 
-
-    log_event("Iniciando proceso de scraping y análisis con Gemini...")
-
-    driver = setup_driver(headless=False)
-    driver.get(URL)
-    wait = WebDriverWait(driver, DEFAULT_TIMEOUT)
-
-    # Hilo de progreso (cada 2 min)
-    t = threading.Thread(target=mostrar_progreso, daemon=True)
-    t.start()
-
-    try:
-        wait.until(EC.presence_of_element_located((By.TAG_NAME, "app-root")))
-        log_event("Página cargada correctamente.")
-    except TimeoutException:
-        log_event("Advertencia: app-root no cargó completamente.")
-
-    # Detectar rubros dentro de <li> y filtrar solo los objetivos
-    log_event("🔍 Buscando rubros en la página...")
-    rubros_header = driver.find_element(By.XPATH, "//h4[contains(text(),'Rubros')]")
-    ul_rubros = rubros_header.find_element(By.XPATH, "./following-sibling::ul[contains(@class,'list-rubros')]")
-    rubros_li = ul_rubros.find_elements(By.TAG_NAME, "li")
-
-    rubros_filtrados = []
-    for li in rubros_li:
-        try:
-            a_elem = li.find_element(By.TAG_NAME, "a")
-            if safe_text(a_elem) in RUBROS_OBJETIVO:
-                rubros_filtrados.append(a_elem)
-                log_event(f"✅ Rubro detectado: {safe_text(a_elem)}")
-
-        except Exception as e:
-            logging.error(f"Error filtrando rubros: {e}")
-            log_event(f"⚠ Error filtrando rubro: {e}")
-            continue
-
-    resultados = []
-
-    # Iterar solo los rubros filtrados
-    for idx_rubro, rubro_elem in enumerate(rubros_filtrados):
-        rubro_text = safe_text(rubro_elem)
-        print(f"\n[{idx_rubro+1}] Rubro: {rubro_text}")
-        log_event(f"▶️ Procesando rubro [{idx_rubro+1}]: {rubro_text}")
-        
-        try:
-            driver.execute_script("arguments[0].click();", rubro_elem)
-            time.sleep(1.5)
-
-            pagina_actual = 1
-            while True:
-                comercios = driver.find_elements(By.CSS_SELECTOR, COMERCIO_SELECTOR)
-                total_comercios = len(comercios)
-
-                print(f"  Página {pagina_actual} - Comercios detectados: {total_comercios}")
-                log_event(f"🛍️ Página {pagina_actual} del rubro '{rubro_text}' con {total_comercios} comercios detectados.")
-
-                for i in range(total_comercios):
-                    try:
-                        comercios = driver.find_elements(By.CSS_SELECTOR, COMERCIO_SELECTOR)
-                        com_elem = comercios[i]
-                        driver.execute_script("arguments[0].style.border='3px solid red'", com_elem)
-                        driver.execute_script("arguments[0].click();", com_elem)
-                        time.sleep(2)
-
-                        modal_html = extract_modal_info(driver)
-                        close_modal(driver)
-                        driver.execute_script("arguments[0].style.border=''", com_elem)
-
-                        if not modal_html:
-                            log_event(f"⚠️ Comercio {i+1} en '{rubro_text}' (página {pagina_actual}) sin modal o error al extraer.")
-                            continue
-
-                        resultados.append({
-                            "rubro": rubro_text,
-                            "modal_html": modal_html
-                        })
-
-                        print(f"    ✅ Comercio {i+1} capturado (página {pagina_actual})")
-                        log_event(f"✅ Comercio {i+1} en '{rubro_text}' (página {pagina_actual}) procesado correctamente.")
-
-                    except Exception as e:
-                        logging.error(f"Error procesando comercio {i} ({rubro_text}): {e}")
-                        log_event(f"⚠️ Error procesando comercio {i+1} en '{rubro_text}' (página {pagina_actual}): {e}")
-                        continue
-
-                    # Intentar pasar a la siguiente página
-                try:
-                    siguiente_btn = driver.find_element(By.CSS_SELECTOR, "li.page-item a[aria-label='Next']")
-                    parent_li = siguiente_btn.find_element(By.XPATH, "./parent::li")
-
-                    # Si el botón está deshabilitado o no visible, salir
-                    if "disabled" in parent_li.get_attribute("class").lower():
-                        log_event(f"🏁 Fin de paginación alcanzado para rubro '{rubro_text}'.")
-                        break
-
-                    log_event(f"➡️ Avanzando a la página {pagina_actual + 1} del rubro '{rubro_text}'.")
-                    driver.execute_script("arguments[0].click();", siguiente_btn)
-                    time.sleep(2)
-                    pagina_actual += 1
-
-                except Exception:
-                    log_event(f"🏁 No se encontró el botón 'Siguiente'. Fin de paginación para '{rubro_text}'.")
-                    break
-
-        except Exception as e:
-            logging.error(f"Error procesando rubro {rubro_text}: {e}")
-            log_event(f"❌ Error procesando rubro '{rubro_text}': {e}")
-            continue
-
-    # Guardar CSV intermedio
-    keys = ["rubro", "modal_html"]
-    with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
-        writer.writeheader()
-        writer.writerows(resultados)
-
-    print(f"\n📄 Archivo intermedio generado: {os.path.abspath(OUTPUT_CSV)}")
-
-    # ---- Procesar con Gemini ----
-    print("\n🤖 Procesando con Gemini...")
-    processed = []
-    for row in resultados:
-        data = process_with_gemini(row["modal_html"], category_name=row["rubro"])
-        
-        if not data:
-            log_event(f"⚠️ Gemini no devolvió datos para el comercio del rubro '{row['rubro']}'.")
-            continue
-        
-        log_event(f"✅ Gemini procesó correctamente el comercio del rubro '{row['rubro']}'.")
-
-        # 🔹 Desnormalizar sucursales / direcciones
-        data_expandida = []
-        for entry in data if isinstance(data, list) else [data]:
-            sucursales = desnormalizar_sucursales(entry, row["modal_html"])
-            data_expandida.extend(sucursales)
-        
-        processed.extend(data_expandida)
-
-        log_event(f"✅ Total comercios procesados hasta ahora con Gemini: {len(processed)}")
-
-    # 🔹 Crear DataFrame final
-    if processed:
-        df = pd.DataFrame(processed)
-
-        # 🔹 Eliminar columna 'category' si existe
-        if "category" in df.columns:
-            df.drop(columns=["category"], inplace=True)
-
-        # 🔹 Normalizar formato de días
-        def limpiar_dias(valor):
-            if not valor:
-                return ""
-            if isinstance(valor, list):
-                dias = [d.strip().capitalize() for d in valor]
-            elif isinstance(valor, str):
-                dias = re.findall(r"[A-Za-zÁÉÍÓÚáéíóúñÑ]+", valor)
-                dias = [d.capitalize() for d in dias]
-            todos = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-            if all(d in dias for d in todos):
-                return "Todos los días"
-            return ", ".join(dias)
-
-        if "days" in df.columns:
-            df["days"] = df["days"].apply(limpiar_dias)
-
-        log_event(f"📄 Archivo final procesado con Gemini, total registros: {len(df)}")
-
-        df.to_csv(OUTPUT_FINAL, index=False, encoding="utf-8")
-        print(f"\n✅ Archivo final generado: {os.path.abspath(OUTPUT_FINAL)}")
-
-    else:
-        print("⚠️ No se generaron resultados procesados con Gemini.")
-
-    procesando_activo = False
-    driver.quit()
-    log_event("🏁 Proceso finalizado correctamente. Navegador cerrado.")
-"""
 
 def main():
     global procesando_activo
@@ -691,20 +706,57 @@ def main():
     unique_merchants = set()  # Evitar duplicados por merchant_name + location
 
     for row in resultados:
-        data = process_with_gemini(row["modal_html"], category_name=row["rubro"])
-        if not data:
+        modal_html_clean = limpiar_para_json(row["modal_html"])
+        data = process_with_gemini(modal_html_clean, category_name=row["rubro"])
+        # Si la respuesta es un string JSON, intentar parsearla
+
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except json.JSONDecodeError:
+                log_event(f"⚠️ Gemini devolvió texto no JSON para '{row['rubro']}'")
+                continue
+
+        
+        if data is None or (isinstance(data, list) and len(data) == 0):
             log_event(f"⚠️ Gemini no devolvió datos para '{row['rubro']}'")
             continue
 
         for entry in data if isinstance(data, list) else [data]:
-            key = (entry["merchant_name"], entry["location"])
-            if key in unique_merchants:
-                continue
-            unique_merchants.add(key)
-            processed.append(entry)
-            total_beneficios += len(entry.get("benefit", []))
+            beneficio_key = tuple(sorted(b.lower() for b in entry.get("benefit", [])))
 
-    # --- Generar CSV final ---
+            key = (
+                entry.get("merchant_name", "").strip(),
+                entry.get("location", "").strip(),
+                entry.get("address", "").strip(),
+                beneficio_key
+            )
+
+            if key in unique_merchants:
+                log_event(f"⚠️ Comercio duplicado detectado y omitido: {entry.get('merchant_name', '')} - {entry.get('location', '')} - {entry.get('address', '')}, beneficios: {entry.get('benefit', [])}")
+                continue
+
+            unique_merchants.add(key)
+            #No sobreescribir el card_brand devuelto por gemini
+            if not entry.get("card_brand"):
+                entry["card_brand"] = row.get("card_brand", "")
+
+            #Limpiar los beneficios
+            beneficios = entry.get("benefit", [])
+            if isinstance(beneficios, list):
+                beneficios_str = ", ".join(b.replace("[","").replace("]","").replace("'","") for b in beneficios)
+            else:
+                beneficios_str = str(beneficios).replace("[","").replace("]","").replace("'","")
+            
+            entry["benefit"] = beneficios_str
+
+            # Agregar merchant_logo_url 
+            entry["merchant_logo_url"] = row.get("logo_url", "")
+
+            processed.append(entry)
+            log_event(f"✅ Comercio procesado por Gemini: {entry.get('merchant_name', '')} - {entry.get('location', '')} - {entry.get('address', '')}, beneficios: {entry.get('benefit', [])}")
+
+    # --- Generar CSV final FUERA del bucle ---
     if processed:
         df = pd.DataFrame(processed)
         if "category" in df.columns:
@@ -731,6 +783,7 @@ def main():
     procesando_activo = False
     driver.quit()
     log_event("🏁 Proceso finalizado correctamente. Navegador cerrado.")
+
 
 if __name__ == "__main__":
     main()
