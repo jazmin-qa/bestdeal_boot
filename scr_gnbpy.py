@@ -2,6 +2,7 @@ import os
 import time
 import requests
 import csv
+import subprocess
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.service import Service
@@ -107,7 +108,11 @@ def procesar_ofertas(categoria_url, categoria_nombre):
 
         # Descargar PDF
         try:
-            enlace_pdf = wait.until(EC.presence_of_element_located((By.PARTIAL_LINK_TEXT, "Bases y Condiciones")))
+            enlace_pdf = wait.until(
+                EC.presence_of_element_located(
+                    (By.XPATH, "//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'bases y condiciones')]")
+                )
+            )
             pdf_url = enlace_pdf.get_attribute("href")
             ruta_pdf = descargar_pdf(pdf_url, categoria_nombre)
             print(f"✅ PDF descargado: {ruta_pdf}")
@@ -126,7 +131,7 @@ def procesar_ofertas(categoria_url, categoria_nombre):
         time.sleep(2)
 
 def main():
-    categorias = ["Supermercados", "Combustible", "Farmacias"]
+    categorias = ["Combustible"]
 
     try:
         # 1️⃣ Entrar a la página de categorías
@@ -157,6 +162,35 @@ def main():
         time.sleep(3)
         driver.quit()
         print("✅ Proceso completado correctamente.")
+
+        # === Llamar al siguiente script ocr_gnbpy.py ===
+        print("\n➡ Pasando al siguiente Script: ocr_gnbpy.py...")
+
+        log_path = os.path.join(OUTPUT_DIR, "procesamiento.log")
+
+        try:
+            result = subprocess.run(["python3", "ocr_gnbpy.py"], check=True)
+            print("✅ Script ocr_gnbpy.py ejecutado correctamente.")
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Script ocr_gnbpy.py ejecutado correctamente.\n")
+
+        except subprocess.CalledProcessError as e:
+            print(f"⚠ Error al ejecutar ocr_gnbpy.py: código de salida {e.returncode}")
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error al ejecutar ocr_gnbpy.py: código {e.returncode}\n")
+
+        except FileNotFoundError:
+            print("⚠ No se encontró el archivo ocr_gnbpy.py. Verifica que exista en el mismo directorio.")
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ERROR: No se encontró ocr_gnbpy.py\n")
+
+        except Exception as e:
+            print(f"⚠ Error inesperado al ejecutar ocr_gnbpy.py: {e}")
+            with open(log_path, "a", encoding="utf-8") as log_file:
+                log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error inesperado al ejecutar ocr_gnbpy.py: {e}\n")
+
+        print("\n✅ Proceso completo finalizado (solo CSV generado)")
+
 
 if __name__ == "__main__":
     main()

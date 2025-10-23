@@ -12,6 +12,7 @@ import threading
 import  mysql.connector
 import unicodedata
 import time
+import argparse
 
 # Configuración de la base de datos
 
@@ -23,7 +24,6 @@ DB_CONFIG = {
 }
 
 def insert_pdf_mysql(conn, record):
-    """Inserta un registro en la tabla 'web_offers', manejando fechas vacías y evitando errores."""
     try:
         cur = conn.cursor()
 
@@ -96,24 +96,151 @@ def insert_pdf_mysql(conn, record):
             safe_str(record.get("ai_response"))
         ))
 
-
         conn.commit()
-
+    
     except mysql.connector.Error as e:
         print(f"⚠ Error insertando en MySQL: {e}")
         conn.rollback()
     finally:
         cur.close()
 
+
+def upsert_offer_mysql(conn, record):
+    cur = conn.cursor(dictionary=True)
+    compare_fields = [
+        "benefic", "payment_methods", "card_brand", "terms_conditions",
+        "offer_day", "valid_to", "merchant_address", "merchant_location"
+    ]
+
+    try:
+        # --- Normalizar y sanitizar campos ---
+        merchant_name = safe_str(record.get("merchant_name") or record.get("merchant"))
+        bank_name = safe_str(record.get("bank_name") or "BANCO GNB PARAGUAY")
+        merchant_address = safe_str(record.get("merchant_address") or record.get("address"))
+        merchant_location = safe_str(record.get("merchant_location") or record.get("location"))
+        category_name = safe_str(record.get("category_name") or record.get("categoria"))
+        card_brand = safe_str(record.get("card_brand") or record.get("marca_tarjeta"))
+        payment_methods = safe_str(record.get("payment_methods") or record.get("metodo_pago"))
+        benefic = safe_str(record.get("benefic") or record.get("benefit"))
+        terms_conditions = safe_str(record.get("terms_conditions"))
+        offer_day = safe_str(record.get("offer_day"))
+        valid_to = safe_str(record.get("valid_to"))
+        ai_response = safe_str(record.get("ai_response"))
+        source_file = safe_str(record.get("source_file"))
+        terms_raw = safe_str(record.get("terms_raw"))
+
+        record.update({
+            "merchant_name": merchant_name,
+            "merchant_address": merchant_address,
+            "merchant_location": merchant_location,
+            "category_name": category_name,
+            "card_brand": card_brand,
+            "payment_methods": payment_methods,
+            "benefic": benefic,
+            "terms_conditions": terms_conditions,
+            "offer_day": offer_day,
+            "valid_to": valid_to,
+            "ai_response": ai_response,
+            "source_file": source_file,
+            "terms_raw": terms_raw
+        })
+
+        # --- DEBUG: imprimir tipos y valores antes de consultar/actualizar ---
+        debug_fields = {
+            "merchant_name": merchant_name,
+            "merchant_address": merchant_address,
+            "merchant_location": merchant_location,
+            "category_name": category_name,
+            "card_brand": card_brand,
+            "payment_methods": payment_methods,
+            "benefic": benefic,
+            "terms_conditions": terms_conditions,
+            "offer_day": offer_day,
+            "valid_to": valid_to,
+            "ai_response": ai_response,
+            "source_file": source_file,
+            "terms_raw": terms_raw
+        }
+
+        print(f"\n--- DEBUG UPSERT {source_file} ---")
+        for k, v in debug_fields.items():
+            print(f"{k}: {v} ({type(v)})")
+        print("--- FIN DEBUG ---\n")
+
+        # --- Consultar existencia ---
+        cur.execute("""
+            SELECT * FROM web_offers
+            WHERE merchant_name=%s
+              AND bank_name=%s
+              AND merchant_address=%s
+              AND merchant_location=%s
+        """, (merchant_name, bank_name, merchant_address, merchant_location))
+
+        existing = cur.fetchone()
+
+        if existing:
+            changed_fields = []
+            for field in compare_fields:
+                val_new = safe_str(record.get(field, ""))
+                val_old = safe_str(existing.get(field, ""))
+                if val_new != val_old:
+                    changed_fields.append(field)
+
+            if changed_fields:
+                cur.execute("""
+                    UPDATE web_offers SET 
+                        benefit=%s,
+                        payment_methods=%s,
+                        card_brand=%s,
+                        terms_conditions=%s,
+                        offer_day=%s,
+                        valid_to=%s,
+                        category_name=%s,
+                        updated_at=NOW(),
+                        status='A'
+                    WHERE id=%s
+                """, (
+                    benefic,
+                    payment_methods,
+                    card_brand,
+                    terms_conditions,
+                    offer_day,
+                    valid_to,
+                    category_name,
+                    existing["id"]
+                ))
+                conn.commit()
+                print(f"✅ Registro actualizado (ID={existing['id']}) - Campos: {', '.join(changed_fields)}")
+            else:
+                print("🟢 Registro ya existente, sin cambios.")
+        else:
+            # Si no existe, insertar nuevo registro
+            insert_pdf_mysql(conn, record)
+            print(f"🆕 Oferta nueva insertada correctamente: {merchant_name}")
+
+    except mysql.connector.Error as e:
+        conn.rollback()
+        print(f"⚠ Error MySQL en upsert_offer_mysql: {e}")
+    finally:
+        cur.close()
+
 # ========================================
 # CONFIGURACIÓN GENERAL
 # ========================================
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    print("❌ Error: No se encontró la API key en GEMINI_API_KEY")
-    exit(1)
+# La API key se tomará de la variable de entorno GEMINI_API_KEY o del argumento
+# --api-key del CLI; la configuración real de la librería se realiza en
+# configure_gemini(api_key) más abajo.
 
-genai.configure(api_key=GEMINI_API_KEY)
+def configure_gemini(api_key: str):
+    """Configura la librería genai con la API key proporcionada.
+    Lanza ValueError si la clave no es válida (vacía/None).
+    """
+    if not api_key:
+        raise ValueError("Se requiere una API key válida para Gemini")
+    genai.configure(api_key=api_key)
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
 
 PDFS_CSV = "data_gnbpy/beneficios.csv"
 DATA_DIR = Path("data_gnbpy")
@@ -148,7 +275,6 @@ def extract_text_from_pdf(pdf_path):
             if page_text:
                 text += page_text + "\n"
     return text
-
 
 
 def call_gemini_api(category_name, text, pdf_file):
@@ -389,6 +515,32 @@ def extract_text_until_section5(pdf_path):
                 text += page_text + "\n"
     return text
 
+
+
+def normalize_merchant_name(name):
+    """
+    Fuerza el formato 'Marca - Ubicación' si hay dos palabras seguidas.
+    Ejemplo: 'Petrobras Artigas' → 'Petrobras - Artigas'
+    """
+    if not name:
+        return name
+
+    name = name.strip()
+
+    # Si ya tiene guion, no tocar
+    if " - " in name or "-" in name:
+        return name
+
+    # Separar por espacios
+    parts = name.split()
+    if len(parts) == 2:
+        return f"{parts[0]} - {parts[1]}"
+    elif len(parts) > 2:
+        return f"{parts[0]} - {' '.join(parts[1:])}"
+    else:
+        return name
+
+
 def correct_addresses_with_gemini(records, pdf_file):
     """
     Envía todos los registros a Gemini, para que decida si hay que corregir address.
@@ -431,11 +583,15 @@ Texto a corregir/confirmar:
             corrected_record = corrected[corrected_idx]
             merged = r.copy()
             merged.update(corrected_record)
+
+            # 🔹 Forzar formato del merchant_name con guion
+            if "merchant_name" in merged:
+                merged["merchant_name"] = normalize_merchant_name(merged["merchant_name"])
+
             log_event(f"🔹 Dirección revisada por Gemini → Merchant: '{merged.get('merchant_name')}', Location: '{merged.get('location')}', Address: '{merged.get('address')}'")
             new_records.append(merged)
             corrected_idx += 1
         else:
-            # fallback si Gemini devuelve menos registros
             new_records.append(r)
 
     return new_records
@@ -1051,7 +1207,7 @@ def clean_terms(text):
     # Normalizar espacios múltiples a uno solo
     text = re.sub(r"\s+", " ", text)
     return text.strip()
-"""
+
 def main():
     threading.Thread(target=log_periodic_processing, daemon=True).start()
 
@@ -1116,7 +1272,8 @@ def main():
                 }
 
                 try:
-                    insert_pdf_mysql(conn, insert_record)
+                    upsert_offer_mysql(conn, insert_record)
+                    log_event("Modo Online: Se insertó o actualizó en MySQL.")
                 except Exception as e:
                     log_event(f"⚠ Error insertando {pdf_path.name} en MySQL: {e}")
         else:
@@ -1174,7 +1331,8 @@ def main():
                         "ai_response": rec.get("gemini_response", "")
                     }
                     try:
-                        insert_pdf_mysql(conn, insert_record)
+                        upsert_offer_mysql(conn, insert_record)
+                        log_event("Modo Online: Se insertó en MySQL.")
                     except Exception as e:
                         log_event(f"⚠ Error insertando {pdf_name} en MySQL: {e}")
             else:
@@ -1188,62 +1346,7 @@ def main():
 
     conn.close()
     log_event("✅ Proceso finalizado correctamente.")
-"""
-def insert_single_pdf():
-    pdf_path = Path('data_gnbpy/Farmacias/4270_byc-farmatotal-06-2025.pdf')
-    if not pdf_path.exists():
-        log_event(f"❌ PDF no encontrado: {pdf_path}")
-        return
-
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-    except mysql.connector.Error as e:
-        log_event(f"❌ No se pudo conectar a MySQL: {e}")
-        return
-
-    # Procesar el PDF
-    records = process_pdf(pdf_path, category_name="Farmacias")
-    if not records:
-        log_event(f"⚠️ No se extrajeron registros de {pdf_path.name}")
-        conn.close()
-        return
-
-    for rec in records:
-        raw_merchant = rec.get("merchant_name", "") or ""
-        if raw_merchant and isinstance(raw_merchant, str) and raw_merchant.strip() and not is_likely_address(raw_merchant):
-            final_merchant_name = clean_merchant_name(raw_merchant)
-        else:
-            final_merchant_name = "Farmatotal"
-
-        insert_record = {
-            "category_name": rec.get("category_name", "Farmacias"),
-            "bank_name": rec.get("bank_name", "PDF"),
-            "valid_from": rec.get("valid_from"),
-            "valid_to": rec.get("valid_to"),
-            "offer_day": normalize_offer_day(rec.get("offer_day", "")),
-            "benefic": rec.get("benefit", ""),
-            "payment_methods": rec.get("payment_method", ""),
-            "card_brand": rec.get("card_brand", ""),
-            "terms_raw": rec.get("terms_raw", ""),
-            "terms_conditions": clean_terms(rec.get("terms_conditions", "")),
-            "merchant_name": final_merchant_name,
-            "merchant_location": rec.get("location", ""),
-            "merchant_address": rec.get("address", ""),
-            "source_file": rec.get("pdf_file", pdf_path.name),
-            "ai_response": rec.get("gemini_response", ""),
-            "offer_url": ""  # Si quieres, puedes agregar link específico
-        }
-
-        try:
-            insert_pdf_mysql(conn, insert_record)
-            log_event(f"✅ Registro insertado: {final_merchant_name}")
-        except Exception as e:
-            log_event(f"⚠ Error insertando en MySQL: {e}")
-
-    conn.close()
-    log_event(f"✅ Proceso completado para {pdf_path.name}")
 
 
 if __name__ == "__main__":
-    #main()
-    insert_single_pdf()
+    main()   

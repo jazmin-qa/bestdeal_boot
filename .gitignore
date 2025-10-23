@@ -9,7 +9,8 @@
 !scr_gnbpy.py
 !scr_continental.py
 !ocr_continental.py
-
+!scr_interfisa.py
+!ocr_interfisa.py
 # Ignorar carpetas comunes
 __pycache__/
 data/

@@ -80,29 +80,30 @@ def insert_pdf_mysql(conn, record):
                 source, bank_name, payment_methods, offer_url, offer_day, merchant_name,
                 merchant_logo_url, merchant_logo_downloaded, merchant_location,
                 merchant_address, details, category_name, card_brand, benefit,
-                ai_response
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ai_response, status
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
             valid_to,
             valid_from,
             record.get("terms_raw"),
             record.get("terms_conditions"),
             record.get("source_file"),
-            "PDF",  # <-- source fijo
+            "CSV",  # <-- source fijo
             record.get("bank_name"),
             record.get("payment_methods"),
-            record.get("offer_url"),
+            record.get("offer_url") or "",
             record.get("offer_day"),
-            record.get("merchant_name"),
+            record.get("merchant_name") or "",
             record.get("merchant_logo_url"),
             int(record.get("merchant_logo_downloaded", 0) or 0),
-            record.get("merchant_location"),
-            record.get("merchant_address"),
+            record.get("merchant_location") or "",
+            record.get("merchant_address") or "",
             record.get("details"),
             record.get("category_name"),
             record.get("card_brand"),
             record.get("benefic"),
-            record.get("ai_response")
+            record.get("ai_response"),
+            "P" #-- estado 'Pendiente'
         ))
 
 
@@ -128,17 +129,15 @@ LOGOS_DIR = "logos_continental"
 os.makedirs(LOGOS_DIR, exist_ok=True)
 
 LOG_FILE = DATA_DIR / "procesamiento_continental.log"
-RUBROS_OBJETIVO = {
-    "Supermercados": ["Casa Grutter"]
-}
+#RUBROS_OBJETIVO = {
+    #"Farmacias y Perfumerías": []
+#}
 
-
+RUBROS_OBJETIVO = ["Farmacias y Perfumerías"]
 
 def safe_filename(name):
     """Genera un nombre seguro para archivo a partir del nombre del comercio."""    
     return re.sub(r"[^\w\d-]", "_", name.strip().lower())
-
-
 
 
 def limpiar_para_json(texto: str) -> str:
@@ -153,9 +152,8 @@ def limpiar_para_json(texto: str) -> str:
     if not texto:
         return ""
 
-    # 1️⃣ Reemplazar comillas dobles internas por comillas simples
-    texto = texto.replace('""', '"')  # dobles dobles
-    texto = texto.replace('"', "'")
+    # 1️⃣ Escapar comillas dobles internas para JSON
+    texto = texto.replace('"', '\\"')
 
     # 2️⃣ Eliminar caracteres invisibles (como \u200b, \u200c, etc.)
     texto = re.sub(r'[\u200b-\u200f\u202a-\u202e]', '', texto)
@@ -302,7 +300,9 @@ def close_modal(driver):
 def limpiar_dias(valor):
     if not valor:
         return ""
-    
+
+    todos = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+
     # Convertir a texto si viene como lista
     if isinstance(valor, list):
         texto = ", ".join(valor)
@@ -310,19 +310,31 @@ def limpiar_dias(valor):
         texto = str(valor)
 
     texto = texto.strip().lower()
-    todos = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
-    # Si contiene "todos los días", devolver todos los días explícitos
+    # Si contiene "todos los días" o variantes
     if "todos los días" in texto or "todo el día" in texto:
         return ", ".join(todos)
 
     # Extraer palabras que parezcan días
     dias = re.findall(r"(lunes|martes|miércoles|miercoles|jueves|viernes|sábado|sabado|domingo)", texto, flags=re.IGNORECASE)
-    dias = [d.capitalize().replace("Miercoles", "Miércoles").replace("Sabado", "Sábado") for d in dias]
 
-    # Eliminar duplicados y mantener el orden original
+    # Normalizar acentos y capitalización
+    normalizacion = {
+        "lunes": "Lunes",
+        "martes": "Martes",
+        "miércoles": "Miércoles",
+        "miercoles": "Miércoles",
+        "jueves": "Jueves",
+        "viernes": "Viernes",
+        "sábado": "Sábado",
+        "sabado": "Sábado",
+        "domingo": "Domingo"
+    }
+    dias = [normalizacion[d.lower()] for d in dias]
+
+    # Eliminar duplicados manteniendo el orden
     dias_unicos = list(dict.fromkeys(dias))
-    
+
     return ", ".join(dias_unicos)
 
 
@@ -359,12 +371,15 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
 
     ⚠️ REGLAS ESPECIALES:
     - Si existe una ciudad o localidad identificable, concaténala al nombre del comercio en el campo merchant_name con el formato 'Nombre - Ciudad'.
-    - SI no hay ciudad o location, entonces dejar solo el nombre del comercio.
+    - Si no hay ciudad o location, entonces dejar solo el nombre del comercio.
     - Si el texto contiene varios beneficios (por ejemplo: '20% los miércoles y 6 cuotas todos los días'),
-      separa cada uno en un objeto JSON distinto.
+      separa cada uno en un objeto JSON distinto solo si son días o sucursales distintas.
     - Si el HTML contiene múltiples direcciones o localidades, genera un registro por cada dirección y ciudad.
     - Identifica y lista todas las marcas de tarjetas mencionadas (Clásica, Oro, Black, Infinite, Privilege, Mastercard).
     - Excluye marcas en frases como 'No participan las tarjetas Pre-Pagas, Gourmet Card ni Cabal'.
+    - Ejemplos de NO ciudades: medicamentos, productos no medicinales, descuentos, promociones
+    - Beneficios: eliminar "Hasta" y reemplazar "+" por ",".
+    - Si el offer_day viene "Todos los días" entonces reemplazarlo por un listado completo de días. Ej: "Lunes, Martes, Miércoles, Jueves, Viernes, Sábado, Domingo".
 
     Devuelve SOLO JSON válido, sin explicaciones ni texto adicional.
 
@@ -374,7 +389,6 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
 
     def detectar_card_brands(texto):
         texto_l = texto.lower()
-
         posibles = {
             "clásica": "Clásica",
             "clasica": "Clásica",
@@ -385,8 +399,6 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
             "mastercard": "Mastercard",
             "master card": "Mastercard",
         }
-
-        # Detectar exclusiones como “No participan las tarjetas...”
         exclusiones = set()
         negaciones = re.findall(
             r"no\s+(participan|aplican|válido|valen|acumulable).*?(dinelco|pre.?pagas|gourmet|cabal)",
@@ -402,13 +414,59 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
 
         return ", ".join(sorted(set(detectadas)))
 
+    def limpiar_beneficio(texto):
+        """
+        Limpia y normaliza el texto de beneficios para dejar solo:
+        - "% de reintegro"
+        - "X cuotas sin intereses"
+        
+        Ejemplos:
+            "25% de reintegro en cargas de combustible, Pagando con las tarjetas de crédito Privilege Continental."
+            -> "25% de reintegro"
+            "6 cuotas sin intereses pagando con tarjeta Oro"
+            -> "6 cuotas sin intereses"
+        """
+        if not texto:
+            return ""
+
+        # 1️⃣ Eliminar frases innecesarias (tarjetas, productos, POS, etc.)
+        frases_eliminar = [
+            r"en cargas de combustible",
+            r"pagando con las tarjetas de crédito.*",
+            r"exclusivamente a través del pos.*",
+            r"\(en productos seleccionados\)",
+            r"en medicamentos nacionales.*",
+            r"en medicamentos importados.*",
+            r"en productos no medicinales.*",
+            r"en caja*"
+        ]
+        for frase in frases_eliminar:
+            texto = re.sub(frase, "", texto, flags=re.IGNORECASE)
+
+        # 2️⃣ Limpiar espacios extra
+        texto = re.sub(r'\s{2,}', ' ', texto).strip()
+
+        # 3️⃣ Buscar "% de reintegro"
+        match_reintegro = re.search(r'\d{1,3}%\s*de\s*reintegro', texto, flags=re.IGNORECASE)
+        if match_reintegro:
+            return match_reintegro.group(0).capitalize()
+
+        # 4️⃣ Buscar "X cuotas sin intereses"
+        match_cuotas = re.search(r'\d+\s*cuotas\s*sin\s*intereses', texto, flags=re.IGNORECASE)
+        if match_cuotas:
+            return match_cuotas.group(0).capitalize()
+
+        # 5️⃣ Si no se encuentra, devolver texto limpio
+        return texto
+
+
     try:
         response = model.generate_content(prompt)
         text = response.text.strip()
         json_clean = (
             text.replace("```json", "")
                 .replace("```", "")
-                .replace("\u200b", "")  # elimina caracteres invisibles
+                .replace("\u200b", "")
                 .strip()
         )
         log_event("🧠 Respuesta literal de Gemini antes del parseo:")
@@ -417,19 +475,23 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
 
         # Parsear JSON
         try:
-                data = json.loads(json_clean)
-                if isinstance(data, dict):
-                    data = [data]
+            data = json.loads(json_clean)
+            if isinstance(data, dict):
+                data = [data]
+
+            # 🔧 Normalizar nulls a cadenas vacías para evitar cortes posteriores
+            for entry in data:
+                for campo in ["location", "address", "card_brand", "offer_day", "terms_raw", "terms_conditions"]:
+                    if entry.get(campo) is None:
+                        entry[campo] = ""
+
         except Exception as e:
             log_event(f"❌ Error parseando JSON de Gemini: {e}")
-            
-            # Intento de reparación si hay cortes o comillas faltantes
             json_repair = json_clean
             if not json_repair.strip().endswith("]"):
                 json_repair += "]"
             if not json_repair.strip().startswith("["):
                 json_repair = "[" + json_repair
-
             try:
                 data = json.loads(json_repair)
                 log_event("⚙️ JSON parcialmente reparado y cargado correctamente.")
@@ -437,8 +499,6 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
                 log_event(f"🔎 Texto recibido (inicio): {json_clean[:400]}")
                 log_event(f"❌ No se pudo reparar el JSON: {e2}")
                 return []
-
-
 
         enriched = []
         soup = BeautifulSoup(modal_html, "html.parser")
@@ -456,7 +516,6 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
                 if addresses:
                     location_blocks.append({"location": city, "addresses": addresses})
 
-        # Procesamiento principal
         for entry in data:
             entry.setdefault("category_name", category_name or "")
             entry["bank_name"] = "BANCO CONTINENTAL"
@@ -473,29 +532,24 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
             entry.setdefault("location", "")
             entry.setdefault("address", "")
 
-            # --- Detección y separación de múltiples beneficios (por tarjeta) ---
+            # --- Limpiar beneficios ---
+            beneficios_raw = entry.get("benefit", [])
             beneficios = []
-            for b in entry.get("benefit", []):
-                subbenefits = re.split(r"\by\b|;|, y | y, ", b)
-                for sb in subbenefits:
-                    sb = sb.strip()
-                    if sb and any(x in sb.lower() for x in ["%","cuota","interés","intereses","reintegro"]):
-                        beneficios.append(sb.capitalize())
+            for b in beneficios_raw:
+                b = limpiar_beneficio(b)
+                partes = re.split(r",|\by\b|;|, y | y, ", b)
+                for p in partes:
+                    p = p.strip()
+                    if p:
+                        beneficios.append(p.capitalize())
+            entry["benefit"] = beneficios
 
-            if not beneficios:
-                beneficios = entry.get("benefit", [])
+            # --- Normalizar payment_method ---
+            pm = entry.get("payment_method", "").lower()
+            if "tarjetas de crédito continental" in pm:
+                entry["payment_method"] = "Tarjeta de Crédito"
 
-            # --- FILTRAR beneficio prioritario (ej: 20%) ---
-            beneficio_prioritario = None
-            for b in beneficios:
-                if re.search(r"\b20%\b", b):
-                    beneficio_prioritario = b
-                    break
-            if beneficio_prioritario:
-                beneficios = [beneficio_prioritario]
-
-            # --- Detectar marcas solo si Gemini no trajo card_brand ---
-            # --- Manejo seguro del campo card_brand ---
+            # --- Manejo de card_brand ---
             card_brands_raw = entry.get("card_brand", "")
             if isinstance(card_brands_raw, list):
                 card_brands = ", ".join(str(c).strip() for c in card_brands_raw if c)
@@ -503,28 +557,10 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
                 card_brands = card_brands_raw.strip()
             else:
                 card_brands = ""
-
-            # Si sigue vacío, intentar detectarlo automáticamente
-            texto_completo = ""
             if not card_brands:
-                texto_completo = " ".join([
-                    entry.get("terms_raw", ""),
-                    entry.get("terms_conditions", ""),
-                    " ".join(beneficios)
-                ])
+                texto_completo = " ".join([entry.get("terms_raw", ""), entry.get("terms_conditions", ""), " ".join(beneficios)])
                 card_brands = detectar_card_brands(texto_completo)
-
-
-            # Si hay varias combinaciones de beneficios con diferentes tarjetas
-            if len(beneficios) > 1 and "," in card_brands:
-                partes = card_brands.split(",")
-                for b in beneficios:
-                    for marca in partes:
-                        copia = entry.copy()
-                        copia["benefit"] = [b]
-                        copia["card_brand"] = marca.strip()
-                        enriched.append(copia)
-                continue
+            entry["card_brand"] = card_brands
 
             # --- Expandir direcciones ---
             if location_blocks:
@@ -542,9 +578,47 @@ def process_with_gemini(modal_html, category_name=None, pdf_file=None):
                         enriched.append(copia)
                 continue
 
-            entry["benefit"] = beneficios
-            entry["card_brand"] = card_brands
             enriched.append(entry)
+
+
+            # --- Consolidar beneficios del mismo comercio/sucursal ---
+            agrupados = {}
+            for entry in enriched:
+                key = (
+                    entry.get("merchant_name", "").strip().lower(),
+                    entry.get("location", "").strip().lower(),
+                    entry.get("address", "").strip().lower(),
+                    entry.get("payment_method", "").strip().lower()
+                )
+
+                if key not in agrupados:
+                    agrupados[key] = entry
+                else:
+                    existente = agrupados[key]
+
+                    beneficios_antes = set(existente.get("benefit", []))
+                    marcas_antes = set(
+                        [m.strip() for m in existente.get("card_brand", "").split(",") if m.strip()]
+                    )
+
+                    # Combinar beneficios y marcas
+                    beneficios_despues = beneficios_antes | set(entry.get("benefit", []))
+                    marcas_despues = marcas_antes | set(
+                        [m.strip() for m in entry.get("card_brand", "").split(",") if m.strip()]
+                    )
+
+                    # Log de consolidación
+                    log_event(
+                        f"🔗 Unión de beneficios para {entry.get('merchant_name')} | "
+                        f"Ubicación: {entry.get('location')} | Dirección: {entry.get('address')} "
+                        f"→ {len(beneficios_antes)}→{len(beneficios_despues)} beneficios, "
+                        f"{len(marcas_antes)}→{len(marcas_despues)} marcas."
+                    )
+
+                    existente["benefit"] = sorted(beneficios_despues)
+                    existente["card_brand"] = ", ".join(sorted(marcas_despues))
+
+            enriched = list(agrupados.values())
 
         # Guardar log
         with open("procesamiento_continental.log", "a", encoding="utf-8") as log:
@@ -588,7 +662,7 @@ def main():
         try:
             a_elem = li.find_element(By.TAG_NAME, "a")
             rubro_nombre = safe_text(a_elem)
-            if rubro_nombre in RUBROS_OBJETIVO.keys():
+            if rubro_nombre in RUBROS_OBJETIVO:
                 rubros_filtrados.append(a_elem)
                 log_event(f"✅ Rubro detectado para análisis: {rubro_nombre}")
         except Exception as e:
@@ -607,7 +681,6 @@ def main():
             driver.execute_script("arguments[0].click();", rubro_elem)
             time.sleep(1.5)
 
-            permitidos = [c.lower() for c in RUBROS_OBJETIVO.get(rubro_text, [])]
             pagina_actual = 1
             comercios_scrapeados_rubro = 0
 
@@ -625,10 +698,7 @@ def main():
                             close_modal(driver)
                             driver.execute_script("arguments[0].style.border=''", com_elem)
                             continue
-                        if not any(nombre in modal_html.lower() for nombre in permitidos):
-                            close_modal(driver)
-                            driver.execute_script("arguments[0].style.border=''", com_elem)
-                            continue
+                        
                         if any(modal_html == r["modal_html"] for r in resultados):
                             close_modal(driver)
                             driver.execute_script("arguments[0].style.border=''", com_elem)
@@ -726,9 +796,9 @@ def main():
             beneficio_key = tuple(sorted(b.lower() for b in entry.get("benefit", [])))
 
             key = (
-                entry.get("merchant_name", "").strip(),
-                entry.get("location", "").strip(),
-                entry.get("address", "").strip(),
+                (entry.get("merchant_name") or "").strip(),
+                (entry.get("location") or "").strip(),
+                (entry.get("address") or "").strip(),
                 beneficio_key
             )
 
@@ -762,23 +832,66 @@ def main():
         if "category" in df.columns:
             df.drop(columns=["category"], inplace=True)
 
-        if "days" in df.columns:
-            def limpiar_dias(valor):
-                if not valor:
-                    return ""
-                if isinstance(valor, list):
-                    dias = [d.strip().capitalize() for d in valor]
-                elif isinstance(valor, str):
-                    dias = re.findall(r"[A-Za-zÁÉÍÓÚáéíóúñÑ]+", valor)
-                    dias = [d.capitalize() for d in dias]
-                todos = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-                if all(d in dias for d in todos):
-                    return "Todos los días"
-                return ", ".join(dias)
-            df["days"] = df["days"].apply(limpiar_dias)
+            if "days" in df.columns:
+                def limpiar_dias(valor):
+                    todos = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+                    if not valor:
+                        return []
+                    # Si ya es lista
+                    if isinstance(valor, list):
+                        dias = [d.strip().capitalize() for d in valor]
+                    else:
+                        # Extraer palabras que parecen días
+                        dias = re.findall(r"[A-Za-zÁÉÍÓÚáéíóúñÑ]+", str(valor))
+                        dias = [d.capitalize() for d in dias]
+                    # Si el texto original decía "Todos los días", reemplazar por lista completa
+                    if "Todos los días".lower() in str(valor).lower() or set(dias) == set(todos):
+                        return todos
+                    return dias  # Retorna lista de días
+
+                df["days"] = df["days"].apply(limpiar_dias)
+
 
         df.to_csv(OUTPUT_FINAL, index=False, encoding="utf-8")
         log_event(f"📄 Archivo final generado: {OUTPUT_FINAL}")
+        # --- Insertar en MySQL ---
+        try:
+            conn = mysql.connector.connect(**DB_CONFIG)
+            log_event("✅ Conexión a la base de datos establecida correctamente.")
+
+            for entry in processed:
+                record = {
+                    "valid_to": entry.get("valid_to", ""),
+                    "valid_from": entry.get("valid_from", ""),
+                    "terms_raw": entry.get("terms_raw", ""),
+                    "terms_conditions": entry.get("terms_conditions", ""),
+                    "source_file": OUTPUT_FINAL,
+                    "bank_name": "BANCO CONTINENTAL",  # o el banco que estés procesando
+                    "payment_methods": entry.get("payment_method", ""),
+                    "offer_url": entry.get("offer_url") or "https://www.bancontinental.com.py/#/club-continental/comercios",
+                    "offer_day": entry.get("offer_day") or "",
+                    "merchant_name": entry.get("merchant_name", ""),
+                    "merchant_logo_url": entry.get("merchant_logo_url", ""),
+                    "merchant_logo_downloaded": 1 if entry.get("merchant_logo_url") else 0,
+                    "merchant_location": entry.get("location", ""),
+                    "merchant_address": entry.get("address", ""),
+                    "details": entry.get("details", ""),
+                    "category_name": entry.get("category_name") or "",
+                    "card_brand": entry.get("card_brand", ""),
+                    "benefic": entry.get("benefit", ""),
+                    "ai_response": json.dumps(entry, ensure_ascii=False)
+                }
+
+                insert_pdf_mysql(conn, record)
+
+            log_event("💾 Todos los registros fueron insertados en la base de datos correctamente.")
+        except Exception as e:
+            log_event(f"⚠️ Error durante la inserción MySQL: {e}")
+        finally:
+            if 'conn' in locals():
+                conn.close()
+                log_event("🔒 Conexión MySQL cerrada correctamente.")
+
 
     procesando_activo = False
     driver.quit()

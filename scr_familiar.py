@@ -2,13 +2,14 @@ import os
 import time
 import requests
 import csv
+import subprocess  # ✅ Agregado para ejecutar el siguiente script
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.firefox.service import Service
+from selenium.webdriver.chrome.service import Service  # ✅ Cambiado a Chrome
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
-from webdriver_manager.firefox import GeckoDriverManager
+from webdriver_manager.chrome import ChromeDriverManager  # ✅ Cambiado a Chrome
 
 # Globales para consolidado
 registros_globales = []
@@ -16,22 +17,25 @@ urls_descargadas = set()
 global_pdfs = []
 global_logos = []
 
+# Verificar que se halla cargado la GEMINI_API_KEY en las variables de entorno
+
+def gemini_api_key_cargada():
+    return 'GEMINI_API_KEY' in os.environ and os.environ['GEMINI_API_KEY'].strip() != ''
+
+
 def descargar_archivos_categoria(driver, categoria):
     global global_pdfs, global_logos, registros_globales, urls_descargadas
 
     print(f"\n=== Procesando categoría: {categoria} ===")
 
-    # Crear carpetas
     base_folder = os.path.join("data", categoria)
     pdf_folder = os.path.join(base_folder, "pdfs")
     os.makedirs(pdf_folder, exist_ok=True)
     os.makedirs(base_folder, exist_ok=True)
 
-    # Listas por categoría
     lista_pdfs = []
     lista_logos = []
 
-    # Activar checkbox de la categoría
     try:
         label = driver.find_element(By.XPATH, f"//label[.//input[@fs-list-value='{categoria}']]")
         driver.execute_script("arguments[0].click();", label)
@@ -85,79 +89,17 @@ def descargar_archivos_categoria(driver, categoria):
 
         items = driver.find_elements(By.XPATH, "//div[@role='listitem' and contains(@class,'collection-item')]")
         for idx, item in enumerate(items, 1):
-
             pdf_nombre = ""
             pdf_url = ""
             filepath = ""
             logo_url = ""
-
-            # Obtener nombre del comercio si existe
             comercio_nombre = ""
+
             try:
                 comercio_elem = item.find_element(By.XPATH, ".//p[@fs-list-field='name']")
                 comercio_nombre = comercio_elem.text.strip()
             except NoSuchElementException:
-                comercio_nombre = ""
-
-            # Intentar obtener el logo primero
-            try:
-                logo_elem = item.find_element(By.XPATH, ".//img[contains(@src,'http')]")
-                logo_url = logo_elem.get_attribute("src")
-            except NoSuchElementException:
                 pass
-
-            # Luego intentar obtener el PDF
-            try:
-                pdf_elem = item.find_element(By.XPATH, ".//a[contains(@href,'.pdf')]")
-                pdf_url = pdf_elem.get_attribute("href")
-                filename = pdf_url.split("/")[-1]
-                filepath = os.path.join(pdf_folder, filename)
-
-                if pdf_url not in urls_descargadas:
-                    if not os.path.exists(filepath):
-                        resp = requests.get(pdf_url, timeout=10)
-                        with open(filepath, "wb") as f:
-                            f.write(resp.content)
-                    urls_descargadas.add(pdf_url)
-
-                pdf_nombre = filename
-
-                # Guardar PDF con logo asociado
-                lista_pdfs.append({
-                    "categoria": categoria,
-                    "nombre": filename,
-                    "url": pdf_url,
-                    "ruta_local": filepath,
-                    "logo_asociado": logo_url,  # ahora sí existe logo_url
-                    "comercio": comercio_nombre
-                })
-                global_pdfs.append({
-                    "categoria": categoria,
-                    "nombre": filename,
-                    "url": pdf_url,
-                    "ruta_local": filepath,
-                    "logo_asociado": logo_url,
-                    "comercio": comercio_nombre
-                })
-
-            except NoSuchElementException:
-                pass
-
-            # Guardar logo con PDF asociado (si existe alguno de los dos)
-            if logo_url:
-                lista_logos.append({
-                    "categoria": categoria,
-                    "url": logo_url,
-                    "pdf_asociado": pdf_nombre,
-                    "comercio": comercio_nombre
-                })
-                global_logos.append({
-                    "categoria": categoria,
-                    "url": logo_url,
-                    "pdf_asociado": pdf_nombre,
-                    "comercio": comercio_nombre
-                })
-
 
             # Logos
             try:
@@ -180,7 +122,55 @@ def descargar_archivos_categoria(driver, categoria):
             except NoSuchElementException:
                 pass
 
-        # Paginación
+            try:
+                pdf_elem = item.find_element(By.XPATH, ".//a[contains(@href,'.pdf')]")
+                pdf_url = pdf_elem.get_attribute("href")
+                filename = pdf_url.split("/")[-1]
+                filepath = os.path.join(pdf_folder, filename)
+
+                if pdf_url not in urls_descargadas:
+                    if not os.path.exists(filepath):
+                        resp = requests.get(pdf_url, timeout=10)
+                        with open(filepath, "wb") as f:
+                            f.write(resp.content)
+                    urls_descargadas.add(pdf_url)
+
+                pdf_nombre = filename
+
+                lista_pdfs.append({
+                    "categoria": categoria,
+                    "nombre": filename,
+                    "url": pdf_url,
+                    "ruta_local": filepath,
+                    "logo_asociado": logo_url,
+                    "comercio": comercio_nombre
+                })
+                global_pdfs.append({
+                    "categoria": categoria,
+                    "nombre": filename,
+                    "url": pdf_url,
+                    "ruta_local": filepath,
+                    "logo_asociado": logo_url,
+                    "comercio": comercio_nombre
+                })
+
+            except NoSuchElementException:
+                pass
+
+            if logo_url:
+                lista_logos.append({
+                    "categoria": categoria,
+                    "url": logo_url,
+                    "pdf_asociado": pdf_nombre,
+                    "comercio": comercio_nombre
+                })
+                global_logos.append({
+                    "categoria": categoria,
+                    "url": logo_url,
+                    "pdf_asociado": pdf_nombre,
+                    "comercio": comercio_nombre
+                })
+
         try:
             next_btn = driver.find_element(By.XPATH, "//a[contains(@class,'next')]")
             if "disabled" in next_btn.get_attribute("class"):
@@ -191,14 +181,12 @@ def descargar_archivos_categoria(driver, categoria):
         except NoSuchElementException:
             break
 
-    # Deseleccionar checkbox
     try:
         driver.execute_script("arguments[0].click();", label)
         time.sleep(1)
     except:
         pass
 
-    # CSVs por categoría
     with open(os.path.join(base_folder, "pdfs.csv"), "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["categoria", "nombre", "url", "ruta_local", "logo_asociado", "comercio"])
         writer.writeheader()
@@ -209,18 +197,23 @@ def descargar_archivos_categoria(driver, categoria):
         writer.writeheader()
         writer.writerows(lista_logos)
 
-    print(f"📦 PDFs descargados en {categoria}: {total_pdfs}")
-    print(f"📦 Logos registrados en {categoria}: {total_logos}")
+    print(f"📦 PDFs descargados en {categoria}: {len(lista_pdfs)}")
+    print(f"📦 Logos registrados en {categoria}: {len(lista_logos)}")
 
 def main():
+
+    if not gemini_api_key_cargada():
+        print("ERROR: No se encontró la varible de entorno GEMINI_API_KEY.")
+        print("Por favor, configurar GEMINI_API_KEY antes de ejecutar el script.")
+        print(f"export GEMINI_API_KEY=......")
+        return 
+
     global global_pdfs, global_logos
-
-    options = webdriver.FirefoxOptions()
-    options.binary_location = "/opt/firefox/firefox" 
-    #options.add_argument("--headless")
-
-    driver = webdriver.Firefox(
-        service=Service(GeckoDriverManager().install()),
+    # ✅ CAMBIO: usar Chrome en lugar de Firefox
+    options = webdriver.ChromeOptions()
+    # options.add_argument("--headless")  # opcional si no quieres ver la ventana
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
         options=options
     )
 
@@ -233,7 +226,6 @@ def main():
     categorias = [cb.get_attribute("fs-list-value") for cb in checkboxes]
     print(f"📋 Categorías encontradas: {categorias}")
 
-    # Filtro de categorías
     categorias_filtradas = [c for c in categorias if c in ["Supermercado", "Automotor/Combustible", "Bienestar y Salud"]]
     print(f"✅ Categorías a procesar: {categorias_filtradas}")
 
@@ -242,28 +234,56 @@ def main():
 
     driver.quit()
 
-    # Consolidado global PDFs
+    # ✅ Consolidado global PDFs
     if global_pdfs:
-        with open("data/pdfs_totales.csv", "w", newline="", encoding="utf-8") as f:
+        os.makedirs("data", exist_ok=True)
+        csv_path = "data/pdfs_totales.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["categoria", "nombre", "url", "ruta_local", "logo_asociado", "comercio"])
             writer.writeheader()
             writer.writerows(global_pdfs)
-        print(f"\n📊 Consolidado global PDFs: data/pdfs_totales.csv ({len(global_pdfs)} registros)")
+        print(f"\n📊 Consolidado global PDFs guardado en: {csv_path} ({len(global_pdfs)} registros)")
     else:
         print("\n⚠ No se encontraron PDFs para consolidar.")
 
-    # Consolidado global Logos
+    # ✅ Consolidado global Logos
     if global_logos:
-        with open("data/logos_totales.csv", "w", newline="", encoding="utf-8") as f:
+        csv_path_logos = "data/logos_totales.csv"
+        with open(csv_path_logos, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=["categoria", "url", "pdf_asociado", "comercio"])
             writer.writeheader()
             writer.writerows(global_logos)
-        print(f"📊 Consolidado global Logos: data/logos_totales.csv ({len(global_logos)} registros)")
+        print(f"📊 Consolidado global Logos guardado en: {csv_path_logos} ({len(global_logos)} registros)")
     else:
         print("\n⚠ No se encontraron logos para consolidar.")
 
-    print("\n✅ Proceso completado")
+    # ✅ Log y llamada al siguiente script
+    log_path = "data/procesamiento.log"
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Pasando al siguiente Script: ocr_familiar.py\n")
 
+    print("\n➡ Pasando al siguiente Script: ocr_familiar.py...")
+
+    try:
+        result = subprocess.run(["python3", "ocr_familiar.py"], check=True)
+        print("✅ Script ocr_familiar.py ejecutado correctamente.")
+        with open("data/procesamiento.log", "a", encoding="utf-8") as log_file:
+            log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Script ocr_familiar.py ejecutado correctamente.\n")
+    except subprocess.CalledProcessError as e:
+        print(f"⚠ Error al ejecutar ocr_familiar.py: código de salida {e.returncode}")
+        with open("data/procesamiento.log", "a", encoding="utf-8") as log_file:
+            log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error al ejecutar ocr_familiar.py: código {e.returncode}\n")
+    except FileNotFoundError:
+        print("⚠ No se encontró el archivo ocr_familiar.py. Verifica que exista en el mismo directorio.")
+        with open("data/procesamiento.log", "a", encoding="utf-8") as log_file:
+            log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ERROR: No se encontró ocr_familiar.py\n")
+    except Exception as e:
+        print(f"⚠ Error inesperado al ejecutar ocr_familiar.py: {e}")
+        with open("data/procesamiento.log", "a", encoding="utf-8") as log_file:
+            log_file.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error inesperado al ejecutar ocr_familiar.py: {e}\n")
+
+
+    print("\n✅ Proceso completo finalizado (solo CSV generado)")
 
 if __name__ == "__main__":
     main()
