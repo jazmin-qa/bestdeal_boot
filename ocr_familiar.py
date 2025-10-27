@@ -10,6 +10,8 @@ from datetime import datetime
 import csv
 import  mysql.connector
 from difflib import SequenceMatcher
+from rapidfuzz import fuzz
+import unidecode
 
 DB_CONFIG = {
     "host" : "192.168.0.11",
@@ -36,7 +38,33 @@ def log_event(message):
     print(f"[{timestamp}] {message}")  # También lo imprime en consola
 
 
-#FUNCION AUXILIAR PERMITE VERIFICAR LA CANTIDAD DE CONSULTAS REALIZADAS POR SEGUNDO, HASTA 15 POR MINUTO
+
+def normalize_merchant_city(merchant_name, location):
+    """
+    Usa el merchant_name devuelto por Gemini directamente,
+    salvo que no contenga la ciudad o tenga formato claramente incorrecto.
+    """
+    if not merchant_name:
+        return merchant_name or ""
+
+    merchant_name = merchant_name.strip()
+    location = (location or "").strip()
+
+    # Si Gemini ya lo devolvió completo con ciudad y formato correcto, no tocarlo
+    if "-" in merchant_name and not re.search(r' - \s*$', merchant_name):
+        return re.sub(r'\s*[-–—]\s*', ' - ', merchant_name)
+
+    # Si no hay ciudad en el nombre, agregarla
+    if location and location.lower() not in merchant_name.lower():
+        merchant_name = f"{merchant_name} - {location}"
+
+    # Unificar guiones
+    merchant_name = re.sub(r'\s*[-–—]\s*', ' - ', merchant_name)
+
+    return merchant_name
+
+
+#FUNCION AUXILIAR PERMITE VERIFICAR LA CANTIDAD DE CONSULTAS REALIZADAS POR SEGUNDO, HASTA 10 POR MINUTO
 def check_gemini_rate_limit():
     global GEMINI_REQUESTS
     GEMINI_REQUESTS += 1
@@ -112,28 +140,29 @@ def insert_pdf_mysql(conn, record):
     finally:
         cur.close()
 
+
 def upsert_offer_mysql(conn, record):
     cur = conn.cursor(dictionary=True)
 
     compare_fields = [
-        "benefic", "payment_methods", "card_brand", "terms_conditions",
-        "offer_day", "valid_to", "merchant_address", "merchant_location"
+        "benefic", "payment_methods", "card_brand",
+        "offer_day", "valid_to", "merchant_address",
+        "merchant_location", "offer_url", "source_file"
     ]
 
     try:
-        # --- Normalizar campos (usar 'address' y 'location' si existen) ---
-        merchant_name = (record.get("merchant_name") or record.get("merchant") or "").strip()
+        # --- Normalización de campos ---
+        merchant_name_raw = (record.get("merchant_name") or record.get("merchant") or "").strip()
+        merchant_location = (record.get("location") or record.get("merchant_location") or "").strip()
+        merchant_name = normalize_merchant_city(merchant_name_raw, merchant_location)
+
         bank_name = "BANCO FAMILIAR"
         merchant_address = (record.get("address") or record.get("merchant_address") or "").strip()
         merchant_location = (record.get("location") or record.get("merchant_location") or "").strip()
         category_name = (record.get("category_name") or record.get("categoria") or "").strip()
-
-
-        # ✅ Siempre directo desde Gemini
         card_brand = (record.get("marca_tarjeta") or "").strip()
         payment_methods = (record.get("metodo_pago") or "").strip()
 
-        # Actualizar el record base
         record.update({
             "merchant_name": merchant_name,
             "merchant_address": merchant_address,
@@ -143,61 +172,108 @@ def upsert_offer_mysql(conn, record):
             "payment_methods": payment_methods
         })
 
-        cur.execute("""
-            SELECT * FROM web_offers
-            WHERE merchant_name=%s
-              AND bank_name=%s
-              AND merchant_address=%s
-              AND merchant_location=%s
-        """, (merchant_name, bank_name, merchant_address, merchant_location))
+        # --- Buscar posibles coincidencias ---
+        cur.execute("SELECT * FROM web_offers WHERE bank_name=%s", (bank_name,))
+        existing_records = cur.fetchall()
 
-        existing = cur.fetchone()
-        print(f"Resultado de la consulta existente para [{merchant_name}] en [{merchant_location}]:", existing)
+        best_match = None
+        best_score = 0
 
-        if existing:
+
+
+        for existing in existing_records:
+            if existing.get("merchant_location", "").lower() != merchant_location.lower():
+                continue
+
+            sims = [
+                fuzz.ratio(merchant_name, existing.get("merchant_name", ""), processor=None),
+                fuzz.ratio(merchant_address, existing.get("merchant_address", ""), processor=None),
+                fuzz.ratio(merchant_location, existing.get("merchant_location", ""), processor=None),
+                fuzz.ratio(record.get("offer_url", ""), existing.get("offer_url", ""), processor=None),
+                fuzz.ratio(record.get("source_file", ""), existing.get("source_file", ""), processor=None)
+            ]
+            score = sum(sims) / len(sims)
+
+            if score > best_score:
+                best_score = score
+                best_match = existing
+
+        log_event(f"🔍 Mejor coincidencia para [{merchant_name}] = {best_score:.2f}%")
+
+        # --- Actualizar si la similitud supera el 50% ---
+        if best_match and best_score >= 50 and best_match.get("merchant_location", "").lower() == merchant_location.lower():
             changed_fields = []
             for field in compare_fields:
                 val_new = record.get(field, "") or ""
-                val_old = existing.get(field, "") or ""
-                if val_new != val_old:
+                val_old = best_match.get(field, "") or ""
+                if val_new != val_old and val_new not in ["", None, "NaN"]:
                     changed_fields.append(field)
 
             if changed_fields:
-                cur.execute("""
-                    UPDATE web_offers SET 
-                        benefit=%s,
-                        payment_methods=%s,
-                        card_brand=%s,
-                        terms_conditions=%s,
-                        offer_day=%s,
-                        valid_to=%s,
-                        category_name=%s,
-                        updated_at=NOW(),
-                        status='A'
-                    WHERE id=%s
-                """, (
+                update_fields = []
+                update_values = []
+
+                # Actualizar merchant_name si record tiene ciudad y best_match no
+                best_merchant_name = best_match.get("merchant_name", "")
+                if "-" in record["merchant_name"] and (best_merchant_name == "" or "-" not in best_merchant_name):
+                    update_fields.append("merchant_name=%s")
+                    update_values.append(record["merchant_name"])
+
+
+                # --- Campos generales ---
+                update_fields += [
+                    "benefit=%s",
+                    "payment_methods=%s",
+                    "card_brand=%s",
+                    "offer_day=%s",
+                    "valid_to=%s",
+                    "category_name=%s",
+                    "updated_at=NOW()",
+                    "status='A'"
+                ]
+                update_values += [
                     record.get("benefic", ""),
                     payment_methods,
                     card_brand,
-                    record.get("terms_conditions", ""),
                     record.get("offer_day", ""),
                     record.get("valid_to", ""),
-                    category_name,
-                    existing["id"]
-                ))
+                    category_name
+                ]
+
+                # --- Solo actualizar offer_url si viene con valor ---
+                if record.get("offer_url") not in [None, "", "NaN"]:
+                    update_fields.append("offer_url=%s")
+                    update_values.append(record["offer_url"])
+
+                # --- Solo actualizar source_file si viene con valor ---
+                if record.get("source_file") not in [None, "", "NaN"]:
+                    update_fields.append("source_file=%s")
+                    update_values.append(record["source_file"])
+
+                sql = f"""
+                    UPDATE web_offers
+                    SET {', '.join(update_fields)}
+                    WHERE id=%s
+                """
+                update_values.append(best_match["id"])
+
+                cur.execute(sql, tuple(update_values))
                 conn.commit()
-                print(f"✅ Registro actualizado (ID={existing['id']}) - Campos: {', '.join(changed_fields)}")
+                log_event(f"✅ Actualizado (ID={best_match['id']}) con similitud {best_score:.2f}% — Campos: {', '.join(changed_fields)}")
             else:
-                print("🟢 Registro ya existente, sin cambios.")
+                log_event(f"🟢 Registro existente sin cambios (similitud {best_score:.2f}%)")
+
+        # --- Insertar nuevo si no se encuentra coincidencia suficiente ---
         else:
             insert_pdf_mysql(conn, record)
-            print(f"🆕 Oferta nueva insertada correctamente: {merchant_name}")
+            log_event(f"🆕 Insertado nuevo registro (similitud {best_score:.2f}%)")
 
     except mysql.connector.Error as e:
         conn.rollback()
-        print(f"⚠ Error MySQL en upsert_offer_mysql: {e}")
+        log_event(f"⚠ Error MySQL en upsert_offer_mysql: {e}")
     finally:
         cur.close()
+
 
 def ajustar_nombre_comercio(nombre_csv, nombre_pdf, umbral=0.7):
     """
@@ -205,7 +281,7 @@ def ajustar_nombre_comercio(nombre_csv, nombre_pdf, umbral=0.7):
     y la sucursal o detalle extraído del PDF.
 
     Ejemplo:
-        CSV: 'Casa Yasy', PDF: 'Loreto'        -> 'Casa Yasy - Loreto'
+        CSV: 'Casa Yasy', PDF: 'Loreto'        -> 'Casa Yasy - Loreto'l
         CSV: 'Supermercado', PDF: 'Comercial O y M' -> 'Supermercado - Comercial O y M'
         CSV: 'Superseis', PDF: 'Superseis Lagaleria' -> 'Superseis - Lagaleria'
     """
@@ -406,12 +482,6 @@ def extract_text_with_gemini(filepath):
                 name = c.get("merchant", "").strip()
                 loc = c.get("location", "").strip()
                 # Forzar guion entre merchant y location si existe location
-                
-                if loc and loc not in name:
-                    c["merchant"] = f"{name} - {loc}"
-                else:
-                    c["merchant"] = name
-                
                 if "FARMACIA" in name.upper():
                     c["merchant"] = f"{name} - {loc}" if loc else name
             

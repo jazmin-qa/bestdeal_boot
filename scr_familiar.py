@@ -226,7 +226,7 @@ def main():
     categorias = [cb.get_attribute("fs-list-value") for cb in checkboxes]
     print(f"📋 Categorías encontradas: {categorias}")
 
-    categorias_filtradas = [c for c in categorias if c in ["Supermercado", "Automotor/Combustible", "Bienestar y Salud"]]
+    categorias_filtradas = [c for c in categorias if c in ["Supermercado"]]
     print(f"✅ Categorías a procesar: {categorias_filtradas}")
 
     for categoria in categorias_filtradas:
