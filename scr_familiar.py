@@ -23,7 +23,8 @@ def gemini_api_key_cargada():
     return 'GEMINI_API_KEY' in os.environ and os.environ['GEMINI_API_KEY'].strip() != ''
 
 
-def descargar_archivos_categoria(driver, categoria):
+def descargar_archivos_categoria(driver, categoria, comercios_permitidos=None):
+
     global global_pdfs, global_logos, registros_globales, urls_descargadas
 
     print(f"\n=== Procesando categoría: {categoria} ===")
@@ -98,8 +99,17 @@ def descargar_archivos_categoria(driver, categoria):
             try:
                 comercio_elem = item.find_element(By.XPATH, ".//p[@fs-list-field='name']")
                 comercio_nombre = comercio_elem.text.strip()
+                
+                # ✅ Filtro: solo procesar comercios permitidos si la categoría es Automotor/Combustible
+                if comercios_permitidos and categoria == "Automotor/Combustible":
+                    if comercio_nombre.upper() not in [c.upper() for c in comercios_permitidos]:
+                        print(f"⏭️  Omitiendo '{comercio_nombre}' (no está en la lista permitida).")
+                        continue  # Salta al siguiente item sin descargar
+
             except NoSuchElementException:
+                comercio_nombre = ""
                 pass
+
 
             # Logos
             try:
@@ -226,11 +236,23 @@ def main():
     categorias = [cb.get_attribute("fs-list-value") for cb in checkboxes]
     print(f"📋 Categorías encontradas: {categorias}")
 
-    categorias_filtradas = [c for c in categorias if c in ["Supermercado"]]
+    categorias_filtradas = [c for c in categorias if c in ["Supermercado", "Automotor/Combustible", "Bienestar y Salud"]]
     print(f"✅ Categorías a procesar: {categorias_filtradas}")
 
     for categoria in categorias_filtradas:
-        descargar_archivos_categoria(driver, categoria)
+        if categoria == "Automotor/Combustible":
+            # ✅ Solo procesar los comercios permitidos
+            comercios_permitidos = [
+                "ENEX HORQUETA",
+                "PETROMAX KOKUE POTY",
+                "COPETROL",
+                "PUMA ENERGY"
+            ]
+            print(f"⛽ Procesando solo: {', '.join(comercios_permitidos)}")
+            descargar_archivos_categoria(driver, categoria, comercios_permitidos=comercios_permitidos)
+        else:
+            descargar_archivos_categoria(driver, categoria)
+
 
     driver.quit()
 

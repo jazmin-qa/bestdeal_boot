@@ -131,7 +131,7 @@ def procesar_ofertas(categoria_url, categoria_nombre):
         time.sleep(2)
 
 def main():
-    categorias = ["Combustible"]
+    categorias = ["Combustible", "Farmacias", "Supermercados"]
 
     try:
         # 1️⃣ Entrar a la página de categorías
@@ -166,7 +166,7 @@ def main():
         # === Llamar al siguiente script ocr_gnbpy.py ===
         print("\n➡ Pasando al siguiente Script: ocr_gnbpy.py...")
 
-        log_path = os.path.join(OUTPUT_DIR, "procesamiento.log")
+        log_path = os.path.join(OUTPUT_DIR, "procesamiento_gnb.log")
 
         try:
             result = subprocess.run(["python3", "ocr_gnbpy.py"], check=True)

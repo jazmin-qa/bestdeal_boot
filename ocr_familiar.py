@@ -11,7 +11,7 @@ import csv
 import  mysql.connector
 from difflib import SequenceMatcher
 from rapidfuzz import fuzz
-import unidecode
+import unicodedata
 
 DB_CONFIG = {
     "host" : "192.168.0.11",
@@ -39,29 +39,136 @@ def log_event(message):
 
 
 
+def simplify_branch_name(name: str) -> str:
+    """
+    Elimina palabras redundantes ('CENTRAL', 'ASUNCION', 'SHOPPING', etc)
+    y normaliza para comparar sucursales.
+    """
+    if not name:
+        return ""
+
+    name = name.upper()
+    # Quitar acentos y símbolos
+    name = unicodedata.normalize('NFD', name)
+    name = ''.join(c for c in name if unicodedata.category(c) != 'Mn')
+    name = re.sub(r'[^A-Z0-9 -]', '', name)
+
+    # Eliminar palabras poco relevantes
+    stopwords = ['CENTRAL', 'ASUNCION', 'SHOPPING', 'DSHOPPING', 'MALL', 'LOCAL']
+    for sw in stopwords:
+        name = re.sub(rf'\b{sw}\b', '', name)
+
+    # Normalizar guiones
+    name = re.sub(r'\s*-\s*', '-', name)
+    name = re.sub(r'\s+', ' ', name).strip('- ').strip()
+    return name
+
+
 def normalize_merchant_city(merchant_name, location):
     """
-    Usa el merchant_name devuelto por Gemini directamente,
-    salvo que no contenga la ciudad o tenga formato claramente incorrecto.
+    Limpia y normaliza nombres de comercio/sucursal para evitar redundancias.
+    Casos tratados:
+      - Evita repeticiones: STOCK - STOCK BRASILIA → STOCK - BRASILIA
+      - Limpia finales: SUPERSEIS - Express Boquerón Central - CENTRAL → SUPERSEIS - EXPRESS BOQUERON
+      - Estandariza nombres de cadena (STOCK, SUPERSEIS, GRAN VIA)
     """
     if not merchant_name:
-        return merchant_name or ""
+        return ""
 
     merchant_name = merchant_name.strip()
     location = (location or "").strip()
 
-    # Si Gemini ya lo devolvió completo con ciudad y formato correcto, no tocarlo
-    if "-" in merchant_name and not re.search(r' - \s*$', merchant_name):
-        return re.sub(r'\s*[-–—]\s*', ' - ', merchant_name)
+    # Normalizar acentos
+    def normalize_text(t):
+        return "".join(
+            c for c in unicodedata.normalize("NFD", t)
+            if unicodedata.category(c) != "Mn"
+        )
 
-    # Si no hay ciudad en el nombre, agregarla
+    merchant_name = normalize_text(merchant_name)
+    location = normalize_text(location)
+
+    # Limpieza inicial
+    merchant_name = re.sub(r'\s+', ' ', merchant_name)
+    merchant_name = merchant_name.replace("–", "-").replace("—", "-")
+
+    # --- Caso especial STOCK ---
+    if re.search(r'\bSTOCK\b', merchant_name, re.IGNORECASE):
+        merchant_name = re.sub(r'\bSUP\.?\s*STOCK\b', 'STOCK', merchant_name, flags=re.IGNORECASE)
+        merchant_name = re.sub(r'\bSTOCK\s*-\s*STOCK\b', 'STOCK', merchant_name, flags=re.IGNORECASE)
+        merchant_name = re.sub(r'\bSTOCK\s+STOCK\b', 'STOCK', merchant_name, flags=re.IGNORECASE)
+
+        # Extraer posible sucursal
+        match = re.split(r'\bSTOCK\b', merchant_name, flags=re.IGNORECASE)
+        branch = match[1].strip(" -") if len(match) > 1 else ""
+        if branch:
+            merchant_name = f"STOCK - {branch.upper()}"
+        else:
+            merchant_name = "STOCK"
+
+        return merchant_name.strip()
+
+    # --- Caso especial SUPERSEIS ---
+    if re.search(r'\bSUPER\s*SEIS\b|\bSUPERSEIS\b', merchant_name, re.IGNORECASE):
+        merchant_name = re.sub(r'\bSUPERMERCADO\S*\s*', '', merchant_name, flags=re.IGNORECASE)
+        merchant_name = re.sub(r'\bSUPER\s*SEIS\b', 'SUPERSEIS', merchant_name, flags=re.IGNORECASE)
+        merchant_name = re.sub(r'\bSUPERSEIS\s*-\s*SUPERSEIS\b', 'SUPERSEIS', merchant_name, flags=re.IGNORECASE)
+
+        # Extraer parte de sucursal
+        parts = merchant_name.split("-")
+        if len(parts) > 1:
+            branch = re.sub(r'\bCENTRAL\b|\bASUNCION\b', '', parts[1], flags=re.IGNORECASE).strip()
+            merchant_name = f"SUPERSEIS - {branch}".strip(" -")
+        else:
+            merchant_name = "SUPERSEIS"
+
+        return merchant_name.strip()
+
+    # --- Caso especial GRAN VIA ---
+    if re.search(r'\bGRAN\s*VIA\b', merchant_name, re.IGNORECASE):
+        merchant_name = re.sub(r'\bGRAN\s*VIA\b', 'GRAN VIA', merchant_name, flags=re.IGNORECASE)
+        merchant_name = re.sub(r'\bGRAN VIA\s*-\s*GRAN VIA\b', 'GRAN VIA', merchant_name, flags=re.IGNORECASE)
+        parts = merchant_name.split("-")
+        if len(parts) > 1:
+            branch = re.sub(r'\bASUNCION\b|\bCENTRAL\b', '', parts[1], flags=re.IGNORECASE).strip()
+            merchant_name = f"GRAN VIA - {branch}".strip(" -")
+        else:
+            merchant_name = "GRAN VIA"
+        return merchant_name.strip()
+
+    # --- Default: agregar ciudad si falta ---
     if location and location.lower() not in merchant_name.lower():
         merchant_name = f"{merchant_name} - {location}"
 
-    # Unificar guiones
-    merchant_name = re.sub(r'\s*[-–—]\s*', ' - ', merchant_name)
+    merchant_name = re.sub(r'\s*-\s*', ' - ', merchant_name)
+    merchant_name = re.sub(r'\s+', ' ', merchant_name).strip()
 
     return merchant_name
+
+def split_base_city(name):
+    """
+    Devuelve (base, city) donde city puede estar vacío.
+    Maneja separadores ' - ' y '-' y también casos sin guion.
+    """
+    if not name:
+        return ("", "")
+    s = name.strip()
+    # prefer ' - ' split (normalized by normalize_merchant_city)
+    if ' - ' in s:
+        base, _, city = s.rpartition(' - ')
+        base = base.strip()
+        city = city.strip()
+        return (base, city)
+    # fallback: split on '-' without spaces
+    if '-' in s:
+        base, _, city = s.rpartition('-')
+        return (base.strip(), city.strip())
+    # no separator: maybe only base
+    return (s, "")
+
+def normalize_branch_fragment(text):
+    """Simplifica fragmentos de nombres para comparar redundancias tipo 'A.Picco' == 'A Picco'."""
+    return re.sub(r'[\s\.\-]', '', text.strip().lower())
 
 
 #FUNCION AUXILIAR PERMITE VERIFICAR LA CANTIDAD DE CONSULTAS REALIZADAS POR SEGUNDO, HASTA 10 POR MINUTO
@@ -144,6 +251,13 @@ def insert_pdf_mysql(conn, record):
 def upsert_offer_mysql(conn, record):
     cur = conn.cursor(dictionary=True)
 
+    bank_name = "BANCO FAMILIAR"
+    merchant_address = (record.get("address") or record.get("merchant_address") or "").strip()
+    merchant_location = (record.get("location") or record.get("merchant_location") or "").strip()
+    category_name = (record.get("category_name") or record.get("categoria") or "").strip()
+    card_brand = (record.get("marca_tarjeta") or "").strip()
+    payment_methods = (record.get("metodo_pago") or "").strip()
+
     compare_fields = [
         "benefic", "payment_methods", "card_brand",
         "offer_day", "valid_to", "merchant_address",
@@ -151,11 +265,197 @@ def upsert_offer_mysql(conn, record):
     ]
 
     try:
-        # --- Normalización de campos ---
+        # --- 🧹 Normalización inicial ---
         merchant_name_raw = (record.get("merchant_name") or record.get("merchant") or "").strip()
         merchant_location = (record.get("location") or record.get("merchant_location") or "").strip()
         merchant_name = normalize_merchant_city(merchant_name_raw, merchant_location)
 
+        # 🔸 Limpiar redundancias obvias tipo "STOCK - STOCK BRASILIA"
+        merchant_name = re.sub(r'\b(STOCK|SUPERSEIS|GRAN VIA)\s*-\s*\1\b', r'\1', merchant_name, flags=re.IGNORECASE)
+
+        # 🔸 Evitar dobles "CENTRAL" o "ASUNCION"
+        merchant_name = re.sub(r'\b(CENTRAL|ASUNCION)\b', '', merchant_name, flags=re.IGNORECASE)
+        merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
+
+        # Normalizar variantes de "SUP.STOCK", pero conservar sucursales
+        if re.search(r'\bSTOCK\b', merchant_name, flags=re.IGNORECASE):
+            # Eliminar prefijos como SUP., SUPERMERCADO, etc.
+            merchant_name = re.sub(r'^(SUP\.?|SUPERMERCADO)\s*\.?-?\s*', '', merchant_name, flags=re.IGNORECASE)
+
+            # Asegurar formato "STOCK - ..."
+            merchant_name = re.sub(r'^\s*STOCK\s*[-–]?\s*', 'STOCK - ', merchant_name, flags=re.IGNORECASE)
+            merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
+
+            # 🔹 Evitar redundancias tipo "STOCK - Express A.Picco - A.Picco"
+            merchant_name = re.sub(
+                r'^(STOCK\s*-\s*[A-Za-z0-9.°ºáéíóúÁÉÍÓÚñÑ\s]+?)\s*[-–]\s*([A-Za-z0-9.°ºáéíóúÁÉÍÓÚñÑ\s]+)$',
+                lambda m: m.group(1) if normalize_branch_fragment(m.group(1)) == normalize_branch_fragment(m.group(2)) else m.group(0),
+                merchant_name,
+                flags=re.IGNORECASE
+            )
+
+            # Si queda solo "STOCK" sin sucursal → dejar así
+            if re.fullmatch(r'\s*STOCK\s*', merchant_name, flags=re.IGNORECASE):
+                merchant_name = "STOCK"
+            else:
+                # Asegurar formato "STOCK - [Sucursal]"
+                merchant_name = re.sub(r'^\s*STOCK\s*[-–]?\s*', 'STOCK - ', merchant_name, flags=re.IGNORECASE)
+                merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
+
+        #  "SUPERSEIS" no debe incluir su location redundante
+        elif re.match(r'^\s*SUPERSEIS\b', merchant_name, flags=re.IGNORECASE):
+            # Eliminar todo lo que parezca ubicación o departamento
+            merchant_name = re.sub(
+                r'\b(SUPERSEIS\s*-\s*)?(Express\s*)?'
+                r'([A-Za-z0-9.°ºáéíóúÁÉÍÓÚñÑ\s]+?)'
+                r'(\s*,?\s*(Guaira|Itapua|Cordillera|Alto\s*Parana|Paraná|Central|Caaguazu|San\s*Pedro))?$',
+                lambda m: f"SUPERSEIS - {m.group(3).strip()}" if m.group(3).strip() else "SUPERSEIS",
+                merchant_name,
+                flags=re.IGNORECASE
+            )
+
+        elif re.match(r'^\s*FARMAOLIVA\b', merchant_name, flags=re.IGNORECASE):
+            # --- 💊 FARMAOLIVA ---
+            merchant_name = re.sub(r'^\s*(FARMAOLIVA)\s*[-–]?\s*', 'FARMAOLIVA - ', merchant_name, flags=re.IGNORECASE)
+
+            # 🔹 Eliminar repeticiones exactas tipo "Caacupe - Caacupe"
+            merchant_name = re.sub(
+                r'^(FARMAOLIVA\s*-\s*)([A-Za-z0-9.°ºáéíóúÁÉÍÓÚñÑ]+)\s*[-–]?\s*\2\b',
+                r'\1\2',
+                merchant_name,
+                flags=re.IGNORECASE
+            )
+
+            # 🔹 Evitar redundancias cuando la ubicación se repite en el nombre
+            redundancias = [
+                "Asuncion", "Lambare", "Luque", "San Lorenzo", "Fernando De La Mora", "Itaugua",
+                "Caacupe", "Ciudad Del Este", "Pedro Juan Caballero", "Santani", "San Estanislao",
+                "Encarnacion", "Santa Rosa Del Aguaray", "Villarrica", "Coronel Oviedo",
+                "San Bernardino", "Aregua", "Capiata", "Ñemby", "Itá", "Itá Enramada",
+                "Horqueta", "Concepcion", "Ypacarai", "Loma Plata", "Filadelfia"
+            ]
+            for loc in redundancias:
+                pattern = rf'\b({loc})\b.*\b\1\b'
+                merchant_name = re.sub(pattern, loc, merchant_name, flags=re.IGNORECASE)
+
+            # 🔹 Casos tipo "Santa Rosa 2 Santa Rosa Del Aguaray" → dejar "Santa Rosa 2"
+            merchant_name = re.sub(
+                r'^(FARMAOLIVA\s*-\s*)([A-Za-z0-9\s.°ºáéíóúÁÉÍÓÚñÑ]+?)\s+(Santa\s*Rosa\s*Del\s*Aguaray)\b',
+                r'\1\2',
+                merchant_name,
+                flags=re.IGNORECASE
+            )
+
+            # 🔹 Casos tipo "Santani 4 Monte Alto Estanislao - Estanislao (Santani)"
+            merchant_name = re.sub(
+                r'^(FARMAOLIVA\s*-\s*)(.*?)(\s*-\s*)?(San\s*Estanislao|Santani).*',
+                r'\1\2San Estanislao (Santani)',
+                merchant_name,
+                flags=re.IGNORECASE
+            )
+
+            # --- 💊 Regla especial FARMAOLIVA ---
+            merchant_address = (record.get("address") or record.get("merchant_address") or "").strip()
+            merchant_location = (record.get("location") or record.get("merchant_location") or "").strip()
+
+            cur.execute("""
+                SELECT * FROM web_offers
+                WHERE bank_name = %s
+                AND merchant_address = %s
+                AND (merchant_location IS NULL OR TRIM(merchant_location) = '')
+                AND merchant_name LIKE 'FARMAOLIVA%%'
+                LIMIT 1
+            """, (bank_name, merchant_address))
+            farma_existing = cur.fetchone()
+
+            if farma_existing:
+                log_event(f"💊 FARMAOLIVA existente con dirección idéntica y location vacío — se actualizará (ID={farma_existing['id']}).")
+
+                update_fields = []
+                update_values = []
+
+                # Solo actualizar si hay nuevos datos válidos
+                benefit_val = record.get("benefit")
+                if benefit_val not in [None, "", "NaN"]:
+                    update_fields.append("benefit=%s")
+                    update_values.append(benefit_val)
+
+                # Campos no críticos que se pueden reemplazar sin problema
+                update_fields += [
+                    "payment_methods=%s",
+                    "card_brand=%s",
+                    "offer_day=%s",
+                    "valid_to=%s",
+                    "category_name=%s",
+                    "updated_at=NOW()",
+                    "status='A'"
+                ]
+                update_values += [
+                    payment_methods,
+                    card_brand,
+                    record.get("offer_day", ""),
+                    record.get("valid_to", ""),
+                    (record.get("category_name") or record.get("categoria") or "").strip()
+                ]
+
+                # Solo actualizar offer_url si hay un valor nuevo
+                offer_url_val = record.get("offer_url")
+                if offer_url_val not in [None, "", "NaN"]:
+                    update_fields.append("offer_url=%s")
+                    update_values.append(offer_url_val)
+
+                # Solo actualizar source_file si hay un valor nuevo
+                source_file_val = record.get("source_file")
+                if source_file_val not in [None, "", "NaN"]:
+                    update_fields.append("source_file=%s")
+                    update_values.append(source_file_val)
+
+                # Completar location solo si el nuevo lo tiene
+                if merchant_location:
+                    update_fields.append("merchant_location=%s")
+                    update_values.append(merchant_location)
+
+                sql = f"""
+                    UPDATE web_offers
+                    SET {', '.join(update_fields)}
+                    WHERE id=%s
+                """
+                update_values.append(farma_existing["id"])
+
+                cur.execute(sql, tuple(update_values))
+                conn.commit()
+                log_event(f"✅ FARMAOLIVA actualizado sin cambiar merchant_name (ID={farma_existing['id']})")
+                cur.close()
+                return
+
+            # 🔹 Si el nombre ya contiene la ciudad, no concatenar `merchant_location`
+            if merchant_location:
+                loc_norm = merchant_location.strip().title()
+                if not re.search(rf'\b{re.escape(loc_norm)}\b', merchant_name, flags=re.IGNORECASE):
+                    merchant_name = f"{merchant_name} {loc_norm}"
+
+            # 🔹 Limpieza final
+            merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
+
+            # 🔹 Formato final coherente
+            merchant_name = (
+                merchant_name.title()
+                .replace("Superseis", "SUPERSEIS")
+                .replace("Stock", "STOCK")
+                .replace("Farmaoliva", "FARMAOLIVA")
+            )
+                
+
+
+    # 🔧 Normalización final
+        merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
+        merchant_name = (
+            merchant_name.title()
+            .replace("Superseis", "SUPERSEIS")
+            .replace("Stock", "STOCK")
+            .replace("Farmaoliva", "FARMAOLIVA")
+        )
+            
         bank_name = "BANCO FAMILIAR"
         merchant_address = (record.get("address") or record.get("merchant_address") or "").strip()
         merchant_location = (record.get("location") or record.get("merchant_location") or "").strip()
@@ -172,27 +472,24 @@ def upsert_offer_mysql(conn, record):
             "payment_methods": payment_methods
         })
 
-        # --- Buscar posibles coincidencias ---
+        simplified_name = simplify_branch_name(merchant_name)
+
+        # --- 🔍 Buscar posibles coincidencias ---
         cur.execute("SELECT * FROM web_offers WHERE bank_name=%s", (bank_name,))
         existing_records = cur.fetchall()
 
         best_match = None
         best_score = 0
 
-
-
         for existing in existing_records:
-            if existing.get("merchant_location", "").lower() != merchant_location.lower():
-                continue
+            existing_simplified = simplify_branch_name(existing.get("merchant_name", ""))
 
-            sims = [
-                fuzz.ratio(merchant_name, existing.get("merchant_name", ""), processor=None),
-                fuzz.ratio(merchant_address, existing.get("merchant_address", ""), processor=None),
-                fuzz.ratio(merchant_location, existing.get("merchant_location", ""), processor=None),
-                fuzz.ratio(record.get("offer_url", ""), existing.get("offer_url", ""), processor=None),
-                fuzz.ratio(record.get("source_file", ""), existing.get("source_file", ""), processor=None)
-            ]
-            score = sum(sims) / len(sims)
+            # 🔸 Comparar nombres simplificados (sin "CENTRAL", "SHOPPING", etc.)
+            name_score = fuzz.ratio(simplified_name, existing_simplified)
+            addr_score = fuzz.ratio(merchant_address, existing.get("merchant_address", ""), processor=None)
+            loc_score = fuzz.ratio(merchant_location, existing.get("merchant_location", ""), processor=None)
+
+            score = (name_score * 2 + addr_score + loc_score) / 4  # pondera más el nombre
 
             if score > best_score:
                 best_score = score
@@ -200,8 +497,24 @@ def upsert_offer_mysql(conn, record):
 
         log_event(f"🔍 Mejor coincidencia para [{merchant_name}] = {best_score:.2f}%")
 
-        # --- Actualizar si la similitud supera el 50% ---
-        if best_match and best_score >= 50 and best_match.get("merchant_location", "").lower() == merchant_location.lower():
+        # --- 🧠 Lógica para evitar duplicados ---
+        if best_match:
+            existing_simplified = simplify_branch_name(best_match.get("merchant_name", ""))
+            same_branch = simplified_name == existing_simplified
+
+            # 🛑 Evitar insertar si son el mismo local (aunque el nombre difiera levemente)
+            if same_branch and best_score >= 60:
+                log_event(f"🟢 Mismo comercio detectado ({merchant_name}) — actualizando existente.")
+            elif best_score >= 85 and same_branch:
+                log_event(f"🟢 Coincidencia alta (>{best_score:.2f}%) — evita duplicado.")
+            elif not same_branch and best_score < 75:
+                log_event(f"🏬 Nueva sucursal detectada ({merchant_name}) — se insertará.")
+                insert_pdf_mysql(conn, record)
+                cur.close()
+                return
+
+        # --- 🔄 Actualizar si es misma sucursal ---
+        if best_match and simplify_branch_name(best_match["merchant_name"]) == simplified_name and best_score >= 60:
             changed_fields = []
             for field in compare_fields:
                 val_new = record.get(field, "") or ""
@@ -213,14 +526,6 @@ def upsert_offer_mysql(conn, record):
                 update_fields = []
                 update_values = []
 
-                # Actualizar merchant_name si record tiene ciudad y best_match no
-                best_merchant_name = best_match.get("merchant_name", "")
-                if "-" in record["merchant_name"] and (best_merchant_name == "" or "-" not in best_merchant_name):
-                    update_fields.append("merchant_name=%s")
-                    update_values.append(record["merchant_name"])
-
-
-                # --- Campos generales ---
                 update_fields += [
                     "benefit=%s",
                     "payment_methods=%s",
@@ -240,12 +545,10 @@ def upsert_offer_mysql(conn, record):
                     category_name
                 ]
 
-                # --- Solo actualizar offer_url si viene con valor ---
                 if record.get("offer_url") not in [None, "", "NaN"]:
                     update_fields.append("offer_url=%s")
                     update_values.append(record["offer_url"])
 
-                # --- Solo actualizar source_file si viene con valor ---
                 if record.get("source_file") not in [None, "", "NaN"]:
                     update_fields.append("source_file=%s")
                     update_values.append(record["source_file"])
@@ -263,7 +566,6 @@ def upsert_offer_mysql(conn, record):
             else:
                 log_event(f"🟢 Registro existente sin cambios (similitud {best_score:.2f}%)")
 
-        # --- Insertar nuevo si no se encuentra coincidencia suficiente ---
         else:
             insert_pdf_mysql(conn, record)
             log_event(f"🆕 Insertado nuevo registro (similitud {best_score:.2f}%)")
@@ -1186,7 +1488,7 @@ def main():
                     #parsed["merchant"] = ajustar_nombre_comercio(nombre_csv, nombre_pdf)
                     upsert_offer_mysql(conn, parsed_row)
                 except Exception as e:
-                    log_event(f"⚠ Error en MySQL: (Modo Beta)")
+                    log_event(f"⚠ Error en MySQL: {e}")
             else:
                 log_event(f"⚠ Sin fechas válidas — no se inserta: {nombre}")
                 #failed_vigencia_pdfs[local_path] = nombre

@@ -1,4 +1,5 @@
 Ejecución scr_familiar.py, scr_gnbpy.py, scr_continental.py
+
 Python 3.13
 1. Crear un entorno
 
@@ -20,9 +21,9 @@ pip install google-generativeai
 pip install mysql-connector-python
 pip install camelot-py
 pip install PyPDF2
+pip install fuzzywuzzy
 
 4. Ejecución del script
-
 python scr_familiar.py
 python scr_gnbypy.py
 python scr_continental.py

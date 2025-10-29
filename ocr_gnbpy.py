@@ -13,6 +13,8 @@ import  mysql.connector
 import unicodedata
 import time
 import argparse
+from rapidfuzz import fuzz
+import unicodedata
 
 # Configuración de la base de datos
 
@@ -22,6 +24,24 @@ DB_CONFIG = {
     "password" : "Crite.2019",
     "database" : "best_deal"
 }
+
+def parse_date_safe(value):
+    """Devuelve una fecha YYYY-MM-DD válida o None si está vacía o malformada."""
+    if not value:
+        return None
+    try:
+        # Aceptar formatos comunes: 2025-10-25, 25/10/2025, 2025/10/25
+        value = str(value).strip().replace("/", "-")
+        # Si está en formato DD-MM-YYYY
+        parts = value.split("-")
+        if len(parts[0]) == 2 and len(parts[-1]) == 4:
+            dt = datetime.strptime(value, "%d-%m-%Y")
+        else:
+            dt = datetime.strptime(value, "%Y-%m-%d")
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
 
 def insert_pdf_mysql(conn, record):
     try:
@@ -36,29 +56,22 @@ def insert_pdf_mysql(conn, record):
         valid_from = clean_date(record.get("valid_from"))
         valid_to = clean_date(record.get("valid_to"))
 
-        # --- DEBUG: imprimir tipos y contenido de cada campo ---
+        # --- Normalizar location ---
+        raw_location = safe_str(record.get("merchant_location"))
+        if not raw_location or raw_location.strip().lower() in ["none", "null", "farmatotal"]:
+            merchant_location = ""
+        else:
+            merchant_location = raw_location.strip()
+
+        # --- DEBUG opcional ---
         debug_fields = {
             "valid_to": valid_to,
             "valid_from": valid_from,
-            "terms_raw": record.get("terms_raw"),
-            "terms_conditions": record.get("terms_conditions"),
-            "source_file": record.get("source_file"),
-            "bank_name": record.get("bank_name"),
-            "payment_methods": record.get("payment_methods"),
-            "offer_url": record.get("offer_url"),
-            "offer_day": record.get("offer_day"),
             "merchant_name": record.get("merchant_name"),
-            "merchant_logo_url": record.get("merchant_logo_url"),
-            "merchant_logo_downloaded": record.get("merchant_logo_downloaded"),
-            "merchant_location": record.get("merchant_location"),
-            "merchant_address": record.get("merchant_address"),
-            "details": record.get("details"),
+            "merchant_location": merchant_location,
             "category_name": record.get("category_name"),
-            "card_brand": record.get("card_brand"),
-            "benefic": record.get("benefic"),
-            "ai_response": record.get("ai_response")
+            "source_file": record.get("source_file"),
         }
-
         print(f"\n--- DEBUG INSERT {record.get('source_file','unknown')} ---")
         for k, v in debug_fields.items():
             print(f"{k}: {v} ({type(v)})")
@@ -79,7 +92,7 @@ def insert_pdf_mysql(conn, record):
             safe_str(record.get("terms_raw")),
             safe_str(record.get("terms_conditions")),
             safe_str(record.get("source_file")),
-            "PDF",  # <-- source fijo
+            "PDF",
             safe_str(record.get("bank_name")),
             safe_str(record.get("payment_methods")),
             safe_str(record.get("offer_url")),
@@ -87,7 +100,7 @@ def insert_pdf_mysql(conn, record):
             safe_str(record.get("merchant_name")),
             safe_str(record.get("merchant_logo_url")),
             int(record.get("merchant_logo_downloaded", 0) or 0),
-            safe_str(record.get("merchant_location")),
+            merchant_location,  # 👈 limpio y sin NULL
             safe_str(record.get("merchant_address")),
             safe_str(record.get("details")),
             safe_str(record.get("category_name")),
@@ -97,7 +110,7 @@ def insert_pdf_mysql(conn, record):
         ))
 
         conn.commit()
-    
+
     except mysql.connector.Error as e:
         print(f"⚠ Error insertando en MySQL: {e}")
         conn.rollback()
@@ -105,29 +118,48 @@ def insert_pdf_mysql(conn, record):
         cur.close()
 
 
-def upsert_offer_mysql(conn, record):
+def upsert_offer_mysql(conn, record, updated_ids=None):
+    """Inserta o actualiza una oferta del Banco GNB Paraguay usando comparación por similitud,
+    evitando actualizar la misma ID y detectando nuevas sucursales o PDFs distintos."""
+    if updated_ids is None:
+        updated_ids = set()
+
     cur = conn.cursor(dictionary=True)
+
     compare_fields = [
         "benefic", "payment_methods", "card_brand", "terms_conditions",
         "offer_day", "valid_to", "merchant_address", "merchant_location"
     ]
 
     try:
-        # --- Normalizar y sanitizar campos ---
+        # --- Normalizar campos ---
         merchant_name = safe_str(record.get("merchant_name") or record.get("merchant"))
         bank_name = safe_str(record.get("bank_name") or "BANCO GNB PARAGUAY")
         merchant_address = safe_str(record.get("merchant_address") or record.get("address"))
-        merchant_location = safe_str(record.get("merchant_location") or record.get("location"))
+
+        # 🔧 Normalizar location (sin NULL ni "farmatotal")
+        raw_location = safe_str(record.get("merchant_location") or record.get("location"))
+        if not raw_location or raw_location.strip().lower() in ["none", "null", "farmatotal"]:
+            merchant_location = ""
+        else:
+            merchant_location = raw_location.strip()
+
         category_name = safe_str(record.get("category_name") or record.get("categoria"))
         card_brand = safe_str(record.get("card_brand") or record.get("marca_tarjeta"))
         payment_methods = safe_str(record.get("payment_methods") or record.get("metodo_pago"))
         benefic = safe_str(record.get("benefic") or record.get("benefit"))
         terms_conditions = safe_str(record.get("terms_conditions"))
         offer_day = safe_str(record.get("offer_day"))
+
         valid_to = safe_str(record.get("valid_to"))
+        # 🧩 Validar y limpiar fechas antes de actualizar el record
+        valid_to = parse_date_safe(valid_to)
+
         ai_response = safe_str(record.get("ai_response"))
         source_file = safe_str(record.get("source_file"))
         terms_raw = safe_str(record.get("terms_raw"))
+
+        current_id = record.get("id")
 
         record.update({
             "merchant_name": merchant_name,
@@ -145,46 +177,140 @@ def upsert_offer_mysql(conn, record):
             "terms_raw": terms_raw
         })
 
-        # --- DEBUG: imprimir tipos y valores antes de consultar/actualizar ---
-        debug_fields = {
-            "merchant_name": merchant_name,
-            "merchant_address": merchant_address,
-            "merchant_location": merchant_location,
-            "category_name": category_name,
-            "card_brand": card_brand,
-            "payment_methods": payment_methods,
-            "benefic": benefic,
-            "terms_conditions": terms_conditions,
-            "offer_day": offer_day,
-            "valid_to": valid_to,
-            "ai_response": ai_response,
-            "source_file": source_file,
-            "terms_raw": terms_raw
-        }
+        # --- Buscar candidatos del mismo banco ---
+        cur.execute("SELECT * FROM web_offers WHERE bank_name=%s", (bank_name,))
+        existing_records = cur.fetchall()
 
-        print(f"\n--- DEBUG UPSERT {source_file} ---")
-        for k, v in debug_fields.items():
-            print(f"{k}: {v} ({type(v)})")
-        print("--- FIN DEBUG ---\n")
+        best_match = None
+        best_score = 0
 
-        # --- Consultar existencia ---
-        cur.execute("""
-            SELECT * FROM web_offers
-            WHERE merchant_name=%s
-              AND bank_name=%s
-              AND merchant_address=%s
-              AND merchant_location=%s
-        """, (merchant_name, bank_name, merchant_address, merchant_location))
+        # --- Comparar por similitud ponderada (incluye categoría) ---
+        # --- Comparar por similitud ponderada ---
+        for existing in existing_records:
+            if current_id and existing.get("id") == current_id:
+                continue
 
-        existing = cur.fetchone()
+            # --- Normalizar ---
+            name_new = safe_str(record.get("merchant_name", ""))
+            name_old = safe_str(existing.get("merchant_name", ""))
+            category_new = safe_str(record.get("category_name", ""))
+            category_old = safe_str(existing.get("category_name", ""))
 
-        if existing:
-            changed_fields = []
-            for field in compare_fields:
-                val_new = safe_str(record.get(field, ""))
-                val_old = safe_str(existing.get(field, ""))
-                if val_new != val_old:
-                    changed_fields.append(field)
+            # 🧠 Lógica especial para Supermercados y Petromax
+            if category_new.lower() == "supermercados" or "petromax" in name_new.lower():
+                def clean_name(name):
+                    name = name.lower()
+                    name = re.sub(r"\b(supermercado|super|autoservice|autoservicio|mercado|mini\s?market|market)\b", "", name)
+                    name = re.sub(r"petromax\s*[-–]?\s*\d*", "petromax", name)
+                    return re.sub(r"[^a-záéíóúüñ0-9]", "", name.strip())
+
+                base_new = clean_name(name_new)
+                base_old = clean_name(name_old)
+
+                # Si los nombres base difieren demasiado, se consideran distintos
+                if base_new and base_old and fuzz.ratio(base_new, base_old) < 85:
+                    continue
+
+                # --- Ponderaciones especiales ---
+                weights = {
+                    "merchant_name": 0.30,
+                    "merchant_location": 0.35,
+                    "merchant_address": 0.15,
+                    "terms_conditions": 0.05,
+                    "source_file": 0.10,
+                    "category_name": 0.05,
+                }
+
+                score_sum = 0
+                weight_sum = 0
+                for field, weight in weights.items():
+                    a = safe_str(record.get(field, ""))
+                    b = safe_str(existing.get(field, ""))
+                    if a and b:
+                        score_sum += weight * fuzz.ratio(a, b)
+                        weight_sum += weight
+                score = score_sum / weight_sum if weight_sum > 0 else 0
+
+                # Penalizar nombres con número o ciudad diferente (ej. Capiatá 1 vs Capiatá 2)
+                if (
+                    fuzz.ratio(name_new, name_old) > 80
+                    and re.search(r"\b\d+\b", name_new)
+                    and re.search(r"\b\d+\b", name_old)
+                    and name_new != name_old
+                ):
+                    score = max(score - 25, 0)
+                if (
+                    "petromax" in name_new.lower()
+                    and record.get("merchant_location")
+                    and existing.get("merchant_location")
+                    and fuzz.ratio(record["merchant_location"], existing["merchant_location"]) < 90
+                ):
+                    score = max(score - 20, 0)
+
+            else:
+                # 🔹 Lógica normal para otras categorías
+                weights = {
+                    "merchant_name": 0.4,
+                    "merchant_location": 0.3,
+                    "merchant_address": 0.2,
+                    "terms_conditions": 0.05,
+                    "source_file": 0.05,
+                }
+                score_sum = 0
+                weight_sum = 0
+                for field, weight in weights.items():
+                    a = safe_str(record.get(field, ""))
+                    b = safe_str(existing.get(field, ""))
+                    if a and b:
+                        score_sum += weight * fuzz.ratio(a, b)
+                        weight_sum += weight
+                score = score_sum / weight_sum if weight_sum > 0 else 0
+
+            # --- Guardar mejor coincidencia ---
+            if score > best_score:
+                best_score = score
+                best_match = existing
+
+        log_event(f"🔍 Mejor coincidencia GNB para [{merchant_name}] = {best_score:.2f}%")
+
+        # --- Si hay coincidencia alta, verificar sucursal y PDF ---
+        if best_match and (((category_name.lower() == "supermercados" or "petromax" in merchant_name.lower()) and best_score >= 70) or (category_name.lower() not in ["supermercados"] and "petromax" not in merchant_name.lower() and best_score >= 50)):
+            existing_id = best_match["id"]
+            if existing_id in updated_ids:
+                log_event(f"⏭️ ID={existing_id} ya actualizado en esta sesión. Se omite actualización repetida.")
+                cur.close()
+                return
+
+            name_existing = safe_str(best_match.get("merchant_name"))
+            loc_existing = safe_str(best_match.get("merchant_location"))
+            pdf_existing = safe_str(best_match.get("source_file"))
+
+            same_base = fuzz.ratio(merchant_name, name_existing) >= 80
+            different_city = (
+                merchant_location.lower() != loc_existing.lower()
+                and merchant_location != ""
+                and loc_existing != ""
+            )
+            different_pdf = source_file != pdf_existing
+
+            if same_base and (different_city or different_pdf):
+                log_event(f"🏬 Nueva sucursal o PDF distinto → [{merchant_name}] ({merchant_location}) → {source_file}")
+                insert_pdf_mysql(conn, record)
+                log_event("🆕 Insertado nuevo registro (sucursal/PDF distinta)")
+                cur.close()
+                return
+
+            # Evitar actualizar misma ID
+            if current_id and existing_id == current_id:
+                log_event(f"⏩ Omitido update: misma ID detectada ({current_id})")
+                cur.close()
+                return
+
+            # Detectar cambios reales
+            changed_fields = [
+                field for field in compare_fields
+                if safe_str(record.get(field, "")) != safe_str(best_match.get(field, ""))
+            ]
 
             if changed_fields:
                 cur.execute("""
@@ -207,20 +333,20 @@ def upsert_offer_mysql(conn, record):
                     offer_day,
                     valid_to,
                     category_name,
-                    existing["id"]
+                    existing_id
                 ))
                 conn.commit()
-                print(f"✅ Registro actualizado (ID={existing['id']}) - Campos: {', '.join(changed_fields)}")
+                updated_ids.add(existing_id)
+                log_event(f"✅ Actualizado GNB (ID={existing_id}) - Similitud {best_score:.2f}% - Campos: {', '.join(changed_fields)}")
             else:
-                print("🟢 Registro ya existente, sin cambios.")
+                log_event(f"🟢 GNB sin cambios (similitud {best_score:.2f}%)")
         else:
-            # Si no existe, insertar nuevo registro
             insert_pdf_mysql(conn, record)
-            print(f"🆕 Oferta nueva insertada correctamente: {merchant_name}")
+            log_event(f"🆕 Insertado nuevo registro GNB (similitud {best_score:.2f}%)")
 
     except mysql.connector.Error as e:
         conn.rollback()
-        print(f"⚠ Error MySQL en upsert_offer_mysql: {e}")
+        log_event(f"⚠ Error MySQL en upsert_offer_mysql_gnb: {e}")
     finally:
         cur.close()
 
@@ -947,7 +1073,6 @@ def detect_farmatotal_branch(pdf_path):
     return None
 
 
-
 def normalize_benefits(benefit_field):
     """Normaliza el campo 'benefit' para que sea una lista de beneficios únicos."""
     if isinstance(benefit_field, list):
@@ -1213,15 +1338,20 @@ def main():
 
     all_data = []
     errores_gemini = set()
+    updated_ids = set()  # 👈 Nuevo: control de IDs ya actualizados
 
-    # Conexión a MySQL (una sola vez)
+    # ===============================
+    # CONEXIÓN A MYSQL
+    # ===============================
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
     except mysql.connector.Error as e:
         log_event(f"❌ No se pudo conectar a MySQL: {e}")
         return
 
-    # Leer CSV de PDFs
+    # ===============================
+    # PROCESAR CSV DE PDFs
+    # ===============================
     df_pdfs = pd.read_csv(PDFS_CSV)
     for idx, row in df_pdfs.iterrows():
         pdf_path_str = str(row.get("Ruta PDF")).strip()
@@ -1238,20 +1368,29 @@ def main():
             log_event(f"⚠️ PDF no encontrado: {pdf_path_str}")
             continue
 
-        # Procesar PDF
+        # --- Procesar PDF ---
         records = process_pdf(pdf_path, category_name_csv)
         if records:
             all_data.extend(records)
             log_event(f"✅ PDF procesado: {pdf_path.name} ({len(records)} registros)")
 
-            # Transformar e insertar en MySQL
+            # --- Insertar/actualizar en MySQL ---
             for rec in records:
-                # Determinar merchant_name final: preferir nombre limpio provisto por rec,
-                # si parece válido; sino construir 'Farmatotal - {location}' evitando 'Dirección'.
                 raw_merchant = rec.get("merchant_name", "") or ""
-                if raw_merchant and isinstance(raw_merchant, str) and raw_merchant.strip() and not is_likely_address(raw_merchant) and raw_merchant.strip().lower() not in ["farmatotal", "dirección"]:
+                final_merchant_name = ""
+
+                if (
+                    raw_merchant
+                    and isinstance(raw_merchant, str)
+                    and raw_merchant.strip()
+                    and not is_likely_address(raw_merchant)
+                    and raw_merchant.strip().lower() not in ["farmatotal", "dirección"]
+                ):
                     final_merchant_name = clean_merchant_name(raw_merchant)
-               
+
+                if not final_merchant_name:
+                    final_merchant_name = clean_merchant_name(raw_merchant) if raw_merchant else "Sin nombre"
+
                 insert_record = {
                     "category_name": category_name_csv,
                     "bank_name": rec.get("bank_name", bank_name),
@@ -1268,11 +1407,12 @@ def main():
                     "merchant_address": rec.get("address", ""),
                     "source_file": rec.get("pdf_file", pdf_path.name),
                     "ai_response": rec.get("gemini_response", ""),
-                    "offer_url": offer_url  # <-- Aquí guardamos el link del CSV
+                    "offer_url": offer_url
                 }
 
                 try:
-                    upsert_offer_mysql(conn, insert_record)
+                    # 👇 Se pasa el set de IDs actualizados
+                    upsert_offer_mysql(conn, insert_record, updated_ids)
                     log_event("Modo Online: Se insertó o actualizó en MySQL.")
                 except Exception as e:
                     log_event(f"⚠ Error insertando {pdf_path.name} en MySQL: {e}")
@@ -1280,15 +1420,17 @@ def main():
             errores_gemini.add(pdf_path.name)
             log_event(f"⚠️ No se extrajeron registros de {pdf_path.name}")
 
-    # Guardar resultados a CSV (opcional)
+    # ===============================
+    # GUARDAR RESULTADOS
+    # ===============================
     if all_data:
         all_data = clean_and_deduplicate_data(all_data)
         save_to_csv(all_data)
         log_event(f"💾 {len(all_data)} registros finales guardados en {OUTPUT_CSV}")
 
-    # ======================================
-    # REINTENTAR LOS ERRORES (una sola vez)
-    # ======================================
+    # ===============================
+    # REINTENTAR PDFs CON ERROR
+    # ===============================
     if errores_gemini:
         log_event("🔁 Reintentando PDFs con error...")
         time.sleep(5)
@@ -1303,42 +1445,56 @@ def main():
             log_event(f"🔄 Reintentando: {pdf_name}")
             category_name = pdf_path.parent.name
             records = process_pdf(pdf_path, category_name)
-            if records:
-                reintento_data.extend(records)
-                log_event(f"✅ Reintento exitoso: {pdf_name} ({len(records)} registros)")
-
-                for rec in records:
-                    # para reintentos aplicamos la misma lógica de merchant_name
-                    raw_merchant = rec.get("merchant_name", "") or ""
-                    if raw_merchant and isinstance(raw_merchant, str) and raw_merchant.strip() and not is_likely_address(raw_merchant) and raw_merchant.strip().lower() not in ["farmatotal", "dirección"]:
-                        final_merchant_name = clean_merchant_name(raw_merchant)
-                    
-                    insert_record = {
-                        "category_name": rec.get("category_name", category_name),
-                        "bank_name": rec.get("bank_name", bank_name),
-                        "valid_from": rec.get("valid_from"),
-                        "valid_to": rec.get("valid_to"),
-                        "offer_day": normalize_offer_day(rec.get("offer_day", "")),
-                        "benefic": rec.get("benefit", ""),
-                        "payment_methods": rec.get("payment_method", ""),
-                        "card_brand": rec.get("card_brand", ""),
-                        "terms_raw": rec.get("terms_raw", ""),
-                        "terms_conditions": clean_terms(rec.get("terms_conditions", "")),
-                        "merchant_name": final_merchant_name,
-                        "merchant_location": rec.get("location", ""),
-                        "merchant_address": rec.get("address", ""),
-                        "source_file": rec.get("pdf_file", pdf_path.name),
-                        "ai_response": rec.get("gemini_response", "")
-                    }
-                    try:
-                        upsert_offer_mysql(conn, insert_record)
-                        log_event("Modo Online: Se insertó en MySQL.")
-                    except Exception as e:
-                        log_event(f"⚠ Error insertando {pdf_name} en MySQL: {e}")
-            else:
+            if not records:
                 log_event(f"❌ Reintento fallido: {pdf_name}")
+                continue
 
-        # Guardar reintentos a CSV (opcional)
+            reintento_data.extend(records)
+            log_event(f"✅ Reintento exitoso: {pdf_name} ({len(records)} registros)")
+
+            for rec in records:
+                raw_merchant = rec.get("merchant_name", "") or ""
+                final_merchant_name = ""
+
+                if (
+                    raw_merchant
+                    and isinstance(raw_merchant, str)
+                    and raw_merchant.strip()
+                    and not is_likely_address(raw_merchant)
+                    and raw_merchant.strip().lower() not in ["farmatotal", "dirección"]
+                ):
+                    final_merchant_name = clean_merchant_name(raw_merchant)
+
+                if not final_merchant_name:
+                    final_merchant_name = clean_merchant_name(raw_merchant) if raw_merchant else "Sin nombre"
+
+                insert_record = {
+                    "category_name": rec.get("category_name", category_name),
+                    "bank_name": rec.get("bank_name", bank_name),
+                    "valid_from": rec.get("valid_from"),
+                    "valid_to": rec.get("valid_to"),
+                    "offer_day": normalize_offer_day(rec.get("offer_day", "")),
+                    "benefic": rec.get("benefit", ""),
+                    "payment_methods": rec.get("payment_method", ""),
+                    "card_brand": rec.get("card_brand", ""),
+                    "terms_raw": rec.get("terms_raw", ""),
+                    "terms_conditions": clean_terms(rec.get("terms_conditions", "")),
+                    "merchant_name": final_merchant_name,
+                    "merchant_location": rec.get("location", ""),
+                    "merchant_address": rec.get("address", ""),
+                    "source_file": rec.get("pdf_file", pdf_path.name),
+                    "ai_response": rec.get("gemini_response", ""),
+                    "offer_url": offer_url
+                }
+
+                try:
+                    # 👇 También se pasa el set en los reintentos
+                    upsert_offer_mysql(conn, insert_record, updated_ids)
+                    log_event("Modo Online: Se insertó o actualizó en MySQL (reintento).")
+                except Exception as e:
+                    log_event(f"⚠ Error insertando {pdf_name} en MySQL: {e}")
+
+        # Guardar reintentos a CSV
         if reintento_data:
             reintento_data = clean_and_deduplicate_data(reintento_data)
             save_to_csv(reintento_data)
@@ -1347,6 +1503,5 @@ def main():
     conn.close()
     log_event("✅ Proceso finalizado correctamente.")
 
-
 if __name__ == "__main__":
-    main()   
+    main()                                      

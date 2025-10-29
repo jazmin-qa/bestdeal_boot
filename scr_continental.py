@@ -21,7 +21,8 @@ from bs4 import BeautifulSoup
 import requests
 from urllib.parse import urljoin
 import mysql.connector
-
+import unicodedata
+from fuzzywuzzy import fuzz
 
 
 DB_CONFIG = {
@@ -115,6 +116,132 @@ def insert_pdf_mysql(conn, record):
     finally:
         cur.close()
 
+def upsert_offer_mysql(conn, record):
+    """
+    Inserta o actualiza una oferta en MySQL.
+    Lógica especial para BANCO CONTINENTAL (fuzzy matching >= 60%).
+    """
+    cur = conn.cursor(dictionary=True)
+    bank_name = (record.get("bank_name") or "").strip()
+
+    try:
+        # ============================================================
+        # 🏦 LÓGICA ESPECIAL — BANCO CONTINENTAL
+        # ============================================================
+        if re.match(r'^\s*BANCO\s+CONTINENTAL\b', bank_name, flags=re.IGNORECASE):
+            log_event("🏦 Iniciando lógica especial para BANCO CONTINENTAL...")
+
+            # --- Normalización de texto ---
+            def normalize_text(value):
+                if not value:
+                    return ""
+                value = unicodedata.normalize('NFD', value)
+                value = value.encode('ascii', 'ignore').decode('utf-8')  # elimina acentos
+                value = re.sub(r'[-–]+', '-', value)  # normaliza guiones
+                value = re.sub(r'\s{2,}', ' ', value)
+                return value.strip().title()
+
+            merchant_name_norm = normalize_text(record.get("merchant_name", ""))
+            merchant_address_norm = normalize_text(record.get("merchant_address", ""))
+            merchant_location_norm = normalize_text(record.get("merchant_location", ""))
+
+            # Formato estandar: NOMBRE - LOCATION
+            if merchant_location_norm and not re.search(rf'\b{re.escape(merchant_location_norm)}\b', merchant_name_norm, flags=re.IGNORECASE):
+                merchant_name_norm = f"{merchant_name_norm} - {merchant_location_norm}"
+
+            # --- Buscar registros existentes del banco ---
+            cur.execute("""
+                SELECT id, merchant_name, merchant_address, merchant_location
+                FROM web_offers
+                WHERE bank_name = %s
+            """, (bank_name,))
+            existing = cur.fetchall()
+
+            best_match = None
+            best_score = 0
+
+            for ex in existing:
+                ex_name = normalize_text(ex["merchant_name"])
+                ex_address = normalize_text(ex["merchant_address"])
+                ex_location = normalize_text(ex["merchant_location"])
+
+                # Calcular similitud promedio (pondera más el nombre)
+                score_name = fuzz.ratio(merchant_name_norm, ex_name)
+                score_addr = fuzz.ratio(merchant_address_norm, ex_address)
+                score_loc = fuzz.ratio(merchant_location_norm, ex_location)
+
+                combined_score = (score_name * 2 + score_addr + score_loc) / 4
+
+                # Si faltan dirección y ubicación → comparar solo nombre
+                if not merchant_address_norm and not merchant_location_norm:
+                    combined_score = score_name
+
+                if combined_score > best_score:
+                    best_score = combined_score
+                    best_match = ex
+
+            # --- Si hay coincidencia fuerte, actualizamos ---
+            if best_match and best_score >= 60:
+                log_event(f"🟢 Coincidencia {best_score:.1f}% — actualizando ID={best_match['id']}")
+
+                update_fields = []
+                update_values = []
+
+                # Solo actualizar estos campos si traen contenido
+                for field in ["benefit", "offer_url", "source_file"]:
+                    val = record.get(field)
+                    if val not in [None, "", "NaN"]:
+                        update_fields.append(f"{field}=%s")
+                        update_values.append(val)
+
+                # Campos base que siempre se actualizan
+                update_fields += [
+                    "payment_methods=%s",
+                    "card_brand=%s",
+                    "offer_day=%s",
+                    "valid_to=%s",
+                    "category_name=%s",
+                    "updated_at=NOW()",
+                    "status='A'"
+                ]
+                update_values += [
+                    record.get("payment_methods", ""),
+                    record.get("card_brand", ""),
+                    record.get("offer_day", ""),
+                    record.get("valid_to", ""),
+                    (record.get("category_name") or record.get("categoria") or "").strip()
+                ]
+
+                sql = f"""
+                    UPDATE web_offers
+                    SET {', '.join(update_fields)}
+                    WHERE id=%s
+                """
+                update_values.append(best_match["id"])
+                cur.execute(sql, tuple(update_values))
+                conn.commit()
+
+                log_event(f"✅ BANCO CONTINENTAL actualizado correctamente (ID={best_match['id']})")
+                return
+
+            else:
+                log_event(f"🆕 No se encontró coincidencia fuerte (mejor {best_score:.1f}%) — insertando nuevo registro.")
+                upsert_offer_mysql(conn, record)
+                return
+
+        # ============================================================
+        # 🏦 LÓGICA GENERAL — OTROS BANCOS
+        # ============================================================
+        else:
+            upsert_offer_mysql(conn, record)
+            return
+
+    except mysql.connector.Error as e:
+        log_event(f"⚠ Error en MySQL (BANCO CONTINENTAL): {e}")
+        conn.rollback()
+
+    finally:
+        cur.close()
 
 # --- Configuración ---
 URL = "https://www.bancontinental.com.py/#/club-continental/comercios"
@@ -882,7 +1009,7 @@ def main():
                     "ai_response": json.dumps(entry, ensure_ascii=False)
                 }
 
-                insert_pdf_mysql(conn, record)
+                upsert_offer_mysql(conn, record)
 
             log_event("💾 Todos los registros fueron insertados en la base de datos correctamente.")
         except Exception as e:

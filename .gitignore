@@ -11,6 +11,7 @@
 !ocr_continental.py
 !scr_interfisa.py
 !ocr_interfisa.py
+!documentacion.md
 # Ignorar carpetas comunes
 __pycache__/
 data/
