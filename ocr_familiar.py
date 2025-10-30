@@ -182,6 +182,16 @@ def check_gemini_rate_limit():
         GEMINI_REQUESTS = 0  # resetear contador después de la espera
 
 
+#nueva función para normalizar.
+def normalize_simple(text):
+    """Normaliza texto sin acentos, sin paréntesis y en minúsculas para comparación."""
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    text = re.sub(r'[\(\)]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip().lower()
+
+
 def insert_pdf_mysql(conn, record):
     try:
         cur = conn.cursor()
@@ -220,7 +230,7 @@ def insert_pdf_mysql(conn, record):
             valid_to,
             valid_from,
             record.get("raw_text_snippet", ""),
-            record.get("terms_conditions", ""),
+            record.get("term_conditions", ""),
             record.get("archivo", ""),
             record.get("source", "PDF"),
             "BANCO FAMILIAR",  # <-- en duro
@@ -257,11 +267,12 @@ def upsert_offer_mysql(conn, record):
     category_name = (record.get("category_name") or record.get("categoria") or "").strip()
     card_brand = (record.get("marca_tarjeta") or "").strip()
     payment_methods = (record.get("metodo_pago") or "").strip()
+    terms_conditions = (record.get("term_conditions") or "").strip()
 
     compare_fields = [
         "benefic", "payment_methods", "card_brand",
         "offer_day", "valid_to", "merchant_address",
-        "merchant_location", "offer_url", "source_file"
+        "merchant_location", "offer_url", "source_file", "term_conditions"
     ]
 
     try:
@@ -332,8 +343,10 @@ def upsert_offer_mysql(conn, record):
                 "Caacupe", "Ciudad Del Este", "Pedro Juan Caballero", "Santani", "San Estanislao",
                 "Encarnacion", "Santa Rosa Del Aguaray", "Villarrica", "Coronel Oviedo",
                 "San Bernardino", "Aregua", "Capiata", "Ñemby", "Itá", "Itá Enramada",
-                "Horqueta", "Concepcion", "Ypacarai", "Loma Plata", "Filadelfia"
+                "Horqueta", "Concepcion", "Ypacarai", "Loma Plata", "Filadelfia", "Fdo. de la Mora", 
+                "Nemby"
             ]
+            
             for loc in redundancias:
                 pattern = rf'\b({loc})\b.*\b\1\b'
                 merchant_name = re.sub(pattern, loc, merchant_name, flags=re.IGNORECASE)
@@ -430,9 +443,13 @@ def upsert_offer_mysql(conn, record):
 
             # 🔹 Si el nombre ya contiene la ciudad, no concatenar `merchant_location`
             if merchant_location:
-                loc_norm = merchant_location.strip().title()
-                if not re.search(rf'\b{re.escape(loc_norm)}\b', merchant_name, flags=re.IGNORECASE):
-                    merchant_name = f"{merchant_name} {loc_norm}"
+                name_norm = normalize_simple(merchant_name)
+                loc_norm = normalize_simple(merchant_location)
+
+                # Solo agregar si el nombre NO contiene la ciudad
+                if loc_norm not in name_norm:
+                    merchant_name = f"{merchant_name} {merchant_location.strip().title()}"
+
 
             # 🔹 Limpieza final
             merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
@@ -444,9 +461,8 @@ def upsert_offer_mysql(conn, record):
                 .replace("Stock", "STOCK")
                 .replace("Farmaoliva", "FARMAOLIVA")
             )
+            merchant_name = merchant_name.upper()
                 
-
-
     # 🔧 Normalización final
         merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
         merchant_name = (
@@ -462,14 +478,17 @@ def upsert_offer_mysql(conn, record):
         category_name = (record.get("category_name") or record.get("categoria") or "").strip()
         card_brand = (record.get("marca_tarjeta") or "").strip()
         payment_methods = (record.get("metodo_pago") or "").strip()
+        terms_conditions = (record.get("term_conditions") or "").strip()
 
         record.update({
+
             "merchant_name": merchant_name,
             "merchant_address": merchant_address,
             "merchant_location": merchant_location,
             "category_name": category_name,
             "card_brand": card_brand,
-            "payment_methods": payment_methods
+            "payment_methods": payment_methods,
+            "terms_conditions": terms_conditions,
         })
 
         simplified_name = simplify_branch_name(merchant_name)
@@ -478,24 +497,67 @@ def upsert_offer_mysql(conn, record):
         cur.execute("SELECT * FROM web_offers WHERE bank_name=%s", (bank_name,))
         existing_records = cur.fetchall()
 
+        # --- 🧠 Lógica de comparación actualizada (insensible a mayúsculas, sensible a acentos) ---
         best_match = None
         best_score = 0
 
         for existing in existing_records:
-            existing_simplified = simplify_branch_name(existing.get("merchant_name", ""))
+            existing_addr = (existing.get("merchant_address") or "").strip()
+            existing_loc = (existing.get("merchant_location") or "").strip()
+            existing_name = (existing.get("merchant_name") or "").strip()
 
-            # 🔸 Comparar nombres simplificados (sin "CENTRAL", "SHOPPING", etc.)
-            name_score = fuzz.ratio(simplified_name, existing_simplified)
-            addr_score = fuzz.ratio(merchant_address, existing.get("merchant_address", ""), processor=None)
-            loc_score = fuzz.ratio(merchant_location, existing.get("merchant_location", ""), processor=None)
+            csv_addr = merchant_address.strip()
+            csv_loc = merchant_location.strip()
+            csv_name = merchant_name.strip()
 
-            score = (name_score * 2 + addr_score + loc_score) / 4  # pondera más el nombre
+            # Normalizar solo mayúsculas/minúsculas (manteniendo acentos)
+            def normalize_case(text):
+                return text.casefold()  # más robusto que lower() y preserva acentos
 
-            if score > best_score:
-                best_score = score
-                best_match = existing
+            addr_eq = normalize_case(csv_addr) == normalize_case(existing_addr)
+            loc_eq = normalize_case(csv_loc) == normalize_case(existing_loc)
 
-        log_event(f"🔍 Mejor coincidencia para [{merchant_name}] = {best_score:.2f}%")
+            # 1️⃣ Si el CSV tiene address o location
+            if csv_addr or csv_loc:
+                # 🟢 Caso 1: address y location son idénticos → actualizar sin comparar merchant_name
+                if addr_eq and loc_eq:
+                    best_match = existing
+                    best_score = 100
+                    log_event(f"📍 Coincidencia exacta address+location ({csv_addr}, {csv_loc}) — sin comparar merchant_name")
+
+                    # Si el location en BD está vacío y el CSV lo trae → actualizarlo
+                    if not existing_loc and csv_loc:
+                        existing["merchant_location"] = csv_loc
+                    break
+
+                # 🟢 Caso 2: address coincide, aunque location sea distinto o vacío
+                elif addr_eq:
+                    best_match = existing
+                    best_score = 95
+                    log_event(f"🏠 Coincidencia address ({csv_addr}) — sin comparar merchant_name")
+
+                    # Si el location de BD está vacío y el CSV lo trae → actualizarlo
+                    if not existing_loc and csv_loc:
+                        existing["merchant_location"] = csv_loc
+                    break
+
+            # 2️⃣ Si no hay address ni location → comparar por merchant_name + campos
+            else:
+                existing_simplified = simplify_branch_name(existing.get("merchant_name", ""))
+                name_score = fuzz.ratio(simplified_name.casefold(), existing_simplified.casefold())
+
+                field_score = 0
+                for campo in compare_fields:
+                    val_new = str(record.get(campo, "") or "")
+                    val_old = str(existing.get(campo, "") or "")
+                    if normalize_case(val_new) == normalize_case(val_old) and val_new:
+                        field_score += 1
+
+                total_score = (name_score * 0.7) + (field_score / len(compare_fields) * 30)
+
+                if total_score > best_score:
+                    best_score = total_score
+                    best_match = existing
 
         # --- 🧠 Lógica para evitar duplicados ---
         if best_match:
@@ -1388,7 +1450,7 @@ def process_pdf_file(filepath):
         # Asegurar que terms_conditions sea exactamente lo escrito en el PDF
         fallback["terms_conditions"] = extract_terms_exact(full_text) or fallback.get("terms_conditions", "")
         return [fallback]
-
+ 
     return None
 
 def main():
