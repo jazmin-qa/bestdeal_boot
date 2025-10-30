@@ -109,3 +109,64 @@ Los scripts `scr_familiar.py` / `ocr_familiar.py` y `scr_gnbpy.py` / `ocr_gnbpy.
 - Generar logs completos y gestionados de manera controlada.
 
 ---
+
+## 📘 Descripción general (BANCO CONTINENTAL) => Fecha: 30/10/2025, jazmin
+🧠 Flujo del Script (scr_continental.py)
+
+Observación:
+Este banco tiene un único script debido a que las ofertas se descargan directamente desde la página del banco, es decir, no cuentan con archivos PDF.
+Los datos se extraen del HTML del modal del sitio web del banco.
+
+
+## 💾 Descarga y almacenamiento de datos
+
+El script descarga el HTML de cada modal abierto y extrae todo el contenido HTML cuyo contenedor pertenezca al modal.
+
+Ese HTML se almacena en un archivo .csv tal cual como se encuentra en la página, sin ninguna modificación.
+
+## 🤖 4. Extracción de datos con IA
+
+Una vez descargados los datos, comienza la extracción de cada registro mediante un modelo de inteligencia artificial (IA).
+El modelo extrae correctamente los siguientes campos:
+
+- Categoría
+- Vigencia de la promoción
+- Día de la oferta
+- Beneficios
+- Método de pago
+- Términos y condiciones
+- Dirección (address) y ubicación (location)
+
+## 🔄 5. Inserción y actualización de registros
+
+Cuando el modelo finaliza el análisis y las validaciones, se procede con la inserción o actualización de los registros.
+
+Para esto se utiliza un segundo archivo .csv generado especialmente para ese proceso.
+Durante esta etapa se considera un porcentaje de similitud, pero con un enfoque distinto, ya que los registros no poseen una URL de oferta ni un PDF que los diferencie entre sí.
+
+Por lo tanto, se implementó una clave primaria compuesta que compara tres campos variables:
+
+- merchant_name
+- merchant_address
+- merchant_location
+
+### 👉 En caso de que falten los dos últimos campos, se utiliza únicamente merchant_name.
+### El grado de comparación debe ser ≥ 70 %, sin distinción entre mayúsculas, minúsculas o acentos.
+
+## 🧾 6. Registro de logs de procesamiento
+
+El script genera un archivo de texto llamado procesamiento_continental.log, donde se registran:
+Actualizaciones e inserciones
+Lógica de comparación aplicada
+JSON devuelto por GEMINI
+Cantidad de comercios procesados
+Otros detalles del proceso
+
+## ⚠️ 7. Registro de errores
+
+Adicionalmente, se genera un archivo error_log.txt en el que se almacenan:
+Errores del programa
+Tipos de datos incorrectos
+Cantidad de tokens
+Errores de base de datos
+Otros eventos excepcionales
