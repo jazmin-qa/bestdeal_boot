@@ -230,7 +230,7 @@ def insert_pdf_mysql(conn, record):
             valid_to,
             valid_from,
             record.get("raw_text_snippet", ""),
-            record.get("term_conditions", ""),
+            record.get("terms_conditions", ""),
             record.get("archivo", ""),
             record.get("source", "PDF"),
             "BANCO FAMILIAR",  # <-- en duro
@@ -258,67 +258,65 @@ def insert_pdf_mysql(conn, record):
         cur.close()
 
 
-def upsert_offer_mysql(conn, record):
+def upsert_offer_mysql(conn, record, processed_ids=None):
+    if processed_ids is None:
+        processed_ids = set()
+
     cur = conn.cursor(dictionary=True)
-
     bank_name = "BANCO FAMILIAR"
-    merchant_address = (record.get("address") or record.get("merchant_address") or "").strip()
-    merchant_location = (record.get("location") or record.get("merchant_location") or "").strip()
-    category_name = (record.get("category_name") or record.get("categoria") or "").strip()
-    card_brand = (record.get("marca_tarjeta") or "").strip()
-    payment_methods = (record.get("metodo_pago") or "").strip()
-    terms_conditions = (record.get("term_conditions") or "").strip()
 
-    compare_fields = [
-        "benefic", "payment_methods", "card_brand",
-        "offer_day", "valid_to", "merchant_address",
-        "merchant_location", "offer_url", "source_file", "term_conditions"
+    variable_fields = [
+        "offer_url","merchant_logo_url", "valid_from", "valid_to", "terms_conditions",
+        "payment_methods", "card_brand", "source_file",
+        "benefit", "offer_day", "category_name"
     ]
 
     try:
         # --- 🧹 Normalización inicial ---
         merchant_name_raw = (record.get("merchant_name") or record.get("merchant") or "").strip()
+        merchant_address = (record.get("address") or record.get("merchant_address") or "").strip()
         merchant_location = (record.get("location") or record.get("merchant_location") or "").strip()
+        category_name = (record.get("category_name") or record.get("categoria") or "").strip()
+        card_brand = (record.get("marca_tarjeta") or "").strip()
+        payment_methods = (record.get("metodo_pago") or "").strip()
+        terms_conditions = (record.get("terms_conditions") or "").strip()
+
+        # --- Mapear "benefic" del modelo a "benefit" de la BD ---
+        if "benefic" in record and "benefit" not in record:
+            record["benefit"] = record["benefic"]
+
+        if "url" in record and record["url"]:
+            record["offer_url"] = record["url"]
+
+        if "merchant_logo_url" in record and record["merchant_logo_url"]:
+            record["merchant_logo_url"] = record["merchant_logo_url"]
+
+        # --- Normalización de merchant_name ---
         merchant_name = normalize_merchant_city(merchant_name_raw, merchant_location)
-
-        # 🔸 Limpiar redundancias obvias tipo "STOCK - STOCK BRASILIA"
         merchant_name = re.sub(r'\b(STOCK|SUPERSEIS|GRAN VIA)\s*-\s*\1\b', r'\1', merchant_name, flags=re.IGNORECASE)
-
-        # 🔸 Evitar dobles "CENTRAL" o "ASUNCION"
         merchant_name = re.sub(r'\b(CENTRAL|ASUNCION)\b', '', merchant_name, flags=re.IGNORECASE)
         merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
 
-        # Normalizar variantes de "SUP.STOCK", pero conservar sucursales
+        # --- Reglas especiales ---
         if re.search(r'\bSTOCK\b', merchant_name, flags=re.IGNORECASE):
-            # Eliminar prefijos como SUP., SUPERMERCADO, etc.
             merchant_name = re.sub(r'^(SUP\.?|SUPERMERCADO)\s*\.?-?\s*', '', merchant_name, flags=re.IGNORECASE)
-
-            # Asegurar formato "STOCK - ..."
             merchant_name = re.sub(r'^\s*STOCK\s*[-–]?\s*', 'STOCK - ', merchant_name, flags=re.IGNORECASE)
             merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
-
-            # 🔹 Evitar redundancias tipo "STOCK - Express A.Picco - A.Picco"
             merchant_name = re.sub(
                 r'^(STOCK\s*-\s*[A-Za-z0-9.°ºáéíóúÁÉÍÓÚñÑ\s]+?)\s*[-–]\s*([A-Za-z0-9.°ºáéíóúÁÉÍÓÚñÑ\s]+)$',
                 lambda m: m.group(1) if normalize_branch_fragment(m.group(1)) == normalize_branch_fragment(m.group(2)) else m.group(0),
                 merchant_name,
                 flags=re.IGNORECASE
             )
-
-            # Si queda solo "STOCK" sin sucursal → dejar así
             if re.fullmatch(r'\s*STOCK\s*', merchant_name, flags=re.IGNORECASE):
                 merchant_name = "STOCK"
             else:
-                # Asegurar formato "STOCK - [Sucursal]"
                 merchant_name = re.sub(r'^\s*STOCK\s*[-–]?\s*', 'STOCK - ', merchant_name, flags=re.IGNORECASE)
                 merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
 
-        #  "SUPERSEIS" no debe incluir su location redundante
         elif re.match(r'^\s*SUPERSEIS\b', merchant_name, flags=re.IGNORECASE):
-            # Eliminar todo lo que parezca ubicación o departamento
             merchant_name = re.sub(
-                r'\b(SUPERSEIS\s*-\s*)?(Express\s*)?'
-                r'([A-Za-z0-9.°ºáéíóúÁÉÍÓÚñÑ\s]+?)'
+                r'\b(SUPERSEIS\s*-\s*)?(Express\s*)?([A-Za-z0-9.°ºáéíóúÁÉÍÓÚñÑ\s]+?)'
                 r'(\s*,?\s*(Guaira|Itapua|Cordillera|Alto\s*Parana|Paraná|Central|Caaguazu|San\s*Pedro))?$',
                 lambda m: f"SUPERSEIS - {m.group(3).strip()}" if m.group(3).strip() else "SUPERSEIS",
                 merchant_name,
@@ -326,162 +324,44 @@ def upsert_offer_mysql(conn, record):
             )
 
         elif re.match(r'^\s*FARMAOLIVA\b', merchant_name, flags=re.IGNORECASE):
-            # --- 💊 FARMAOLIVA ---
             merchant_name = re.sub(r'^\s*(FARMAOLIVA)\s*[-–]?\s*', 'FARMAOLIVA - ', merchant_name, flags=re.IGNORECASE)
-
-            # 🔹 Eliminar repeticiones exactas tipo "Caacupe - Caacupe"
-            merchant_name = re.sub(
-                r'^(FARMAOLIVA\s*-\s*)([A-Za-z0-9.°ºáéíóúÁÉÍÓÚñÑ]+)\s*[-–]?\s*\2\b',
-                r'\1\2',
-                merchant_name,
-                flags=re.IGNORECASE
-            )
-
-            # 🔹 Evitar redundancias cuando la ubicación se repite en el nombre
-            redundancias = [
-                "Asuncion", "Lambare", "Luque", "San Lorenzo", "Fernando De La Mora", "Itaugua",
-                "Caacupe", "Ciudad Del Este", "Pedro Juan Caballero", "Santani", "San Estanislao",
-                "Encarnacion", "Santa Rosa Del Aguaray", "Villarrica", "Coronel Oviedo",
-                "San Bernardino", "Aregua", "Capiata", "Ñemby", "Itá", "Itá Enramada",
-                "Horqueta", "Concepcion", "Ypacarai", "Loma Plata", "Filadelfia", "Fdo. de la Mora", 
-                "Nemby"
-            ]
-            
-            for loc in redundancias:
-                pattern = rf'\b({loc})\b.*\b\1\b'
-                merchant_name = re.sub(pattern, loc, merchant_name, flags=re.IGNORECASE)
-
-            # 🔹 Casos tipo "Santa Rosa 2 Santa Rosa Del Aguaray" → dejar "Santa Rosa 2"
-            merchant_name = re.sub(
-                r'^(FARMAOLIVA\s*-\s*)([A-Za-z0-9\s.°ºáéíóúÁÉÍÓÚñÑ]+?)\s+(Santa\s*Rosa\s*Del\s*Aguaray)\b',
-                r'\1\2',
-                merchant_name,
-                flags=re.IGNORECASE
-            )
-
-            # 🔹 Casos tipo "Santani 4 Monte Alto Estanislao - Estanislao (Santani)"
-            merchant_name = re.sub(
-                r'^(FARMAOLIVA\s*-\s*)(.*?)(\s*-\s*)?(San\s*Estanislao|Santani).*',
-                r'\1\2San Estanislao (Santani)',
-                merchant_name,
-                flags=re.IGNORECASE
-            )
-
-            # --- 💊 Regla especial FARMAOLIVA ---
-            merchant_address = (record.get("address") or record.get("merchant_address") or "").strip()
-            merchant_location = (record.get("location") or record.get("merchant_location") or "").strip()
-
             cur.execute("""
                 SELECT * FROM web_offers
-                WHERE bank_name = %s
-                AND merchant_address = %s
+                WHERE bank_name=%s
+                AND merchant_address=%s
                 AND (merchant_location IS NULL OR TRIM(merchant_location) = '')
                 AND merchant_name LIKE 'FARMAOLIVA%%'
                 LIMIT 1
             """, (bank_name, merchant_address))
             farma_existing = cur.fetchone()
-
             if farma_existing:
                 log_event(f"💊 FARMAOLIVA existente con dirección idéntica y location vacío — se actualizará (ID={farma_existing['id']}).")
-
-                update_fields = []
-                update_values = []
-
-                # Solo actualizar si hay nuevos datos válidos
-                benefit_val = record.get("benefit")
-                if benefit_val not in [None, "", "NaN"]:
-                    update_fields.append("benefit=%s")
-                    update_values.append(benefit_val)
-
-                # Campos no críticos que se pueden reemplazar sin problema
-                update_fields += [
-                    "payment_methods=%s",
-                    "card_brand=%s",
-                    "offer_day=%s",
-                    "valid_to=%s",
-                    "category_name=%s",
-                    "updated_at=NOW()",
-                    "status='A'"
-                ]
-                update_values += [
-                    payment_methods,
-                    card_brand,
-                    record.get("offer_day", ""),
-                    record.get("valid_to", ""),
-                    (record.get("category_name") or record.get("categoria") or "").strip()
-                ]
-
-                # Solo actualizar offer_url si hay un valor nuevo
-                offer_url_val = record.get("offer_url")
-                if offer_url_val not in [None, "", "NaN"]:
-                    update_fields.append("offer_url=%s")
-                    update_values.append(offer_url_val)
-
-                # Solo actualizar source_file si hay un valor nuevo
-                source_file_val = record.get("source_file")
-                if source_file_val not in [None, "", "NaN"]:
-                    update_fields.append("source_file=%s")
-                    update_values.append(source_file_val)
-
-                # Completar location solo si el nuevo lo tiene
-                if merchant_location:
-                    update_fields.append("merchant_location=%s")
-                    update_values.append(merchant_location)
-
-                sql = f"""
-                    UPDATE web_offers
-                    SET {', '.join(update_fields)}
-                    WHERE id=%s
-                """
+                update_fields, update_values = [], []
+                for f in variable_fields:
+                    val = record.get(f)
+                    if val not in [None, "", "NaN"]:
+                        update_fields.append(f"{f}=%s")
+                        update_values.append(val)
+                update_fields += ["updated_at=NOW()", "status='A'"]
+                sql = f"UPDATE web_offers SET {', '.join(update_fields)} WHERE id=%s"
                 update_values.append(farma_existing["id"])
-
                 cur.execute(sql, tuple(update_values))
                 conn.commit()
                 log_event(f"✅ FARMAOLIVA actualizado sin cambiar merchant_name (ID={farma_existing['id']})")
+                processed_ids.add(farma_existing["id"])
                 cur.close()
                 return
 
-            # 🔹 Si el nombre ya contiene la ciudad, no concatenar `merchant_location`
-            if merchant_location:
-                name_norm = normalize_simple(merchant_name)
-                loc_norm = normalize_simple(merchant_location)
-
-                # Solo agregar si el nombre NO contiene la ciudad
-                if loc_norm not in name_norm:
-                    merchant_name = f"{merchant_name} {merchant_location.strip().title()}"
-
-
-            # 🔹 Limpieza final
-            merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
-
-            # 🔹 Formato final coherente
-            merchant_name = (
-                merchant_name.title()
-                .replace("Superseis", "SUPERSEIS")
-                .replace("Stock", "STOCK")
-                .replace("Farmaoliva", "FARMAOLIVA")
-            )
-            merchant_name = merchant_name.upper()
-                
-    # 🔧 Normalización final
-        merchant_name = re.sub(r'\s{2,}', ' ', merchant_name).strip(" -")
-        merchant_name = (
-            merchant_name.title()
-            .replace("Superseis", "SUPERSEIS")
-            .replace("Stock", "STOCK")
-            .replace("Farmaoliva", "FARMAOLIVA")
-        )
-            
-        bank_name = "BANCO FAMILIAR"
-        merchant_address = (record.get("address") or record.get("merchant_address") or "").strip()
-        merchant_location = (record.get("location") or record.get("merchant_location") or "").strip()
-        category_name = (record.get("category_name") or record.get("categoria") or "").strip()
-        card_brand = (record.get("marca_tarjeta") or "").strip()
-        payment_methods = (record.get("metodo_pago") or "").strip()
-        terms_conditions = (record.get("term_conditions") or "").strip()
+        elif re.match(r'^\s*PUMA\s+ENERGY\b', merchant_name, flags=re.IGNORECASE):
+            parts = [p.strip() for p in re.split(r'-', merchant_name)]
+            if len(parts) == 2 and parts[1].lower() == "estaciones de servicio":
+                # Solo "PUMA ENERGY"
+                merchant_name = "PUMA ENERGY"
+            elif len(parts) > 2 and parts[1].lower() == "estaciones de servicio":
+                # "PUMA ENERGY - ESTADO/CIUDAD"
+                merchant_name = f"PUMA ENERGY - {parts[2]}"
 
         record.update({
-
             "merchant_name": merchant_name,
             "merchant_address": merchant_address,
             "merchant_location": merchant_location,
@@ -490,154 +370,112 @@ def upsert_offer_mysql(conn, record):
             "payment_methods": payment_methods,
             "terms_conditions": terms_conditions,
         })
-
         simplified_name = simplify_branch_name(merchant_name)
 
-        # --- 🔍 Buscar posibles coincidencias ---
+        # --- 🔍 Buscar registros existentes ---
         cur.execute("SELECT * FROM web_offers WHERE bank_name=%s", (bank_name,))
         existing_records = cur.fetchall()
 
-        # --- 🧠 Lógica de comparación actualizada (insensible a mayúsculas, sensible a acentos) ---
         best_match = None
         best_score = 0
 
         for existing in existing_records:
+            # ⚠️ Evitar actualizar un ID ya procesado en esta sesión
+            if existing["id"] in processed_ids:
+                continue
+
+            existing_category = (existing.get("category_name") or "").strip()
+            category_eq = category_name.casefold() == existing_category.casefold()
             existing_addr = (existing.get("merchant_address") or "").strip()
             existing_loc = (existing.get("merchant_location") or "").strip()
             existing_name = (existing.get("merchant_name") or "").strip()
 
-            csv_addr = merchant_address.strip()
-            csv_loc = merchant_location.strip()
-            csv_name = merchant_name.strip()
+            def normalize_case(t): return t.casefold()
+            addr_eq = normalize_case(merchant_address) == normalize_case(existing_addr)
+            loc_eq = normalize_case(merchant_location) == normalize_case(existing_loc)
+            cat_eq = normalize_case(category_name) == normalize_case(existing_category)
 
-            # Normalizar solo mayúsculas/minúsculas (manteniendo acentos)
-            def normalize_case(text):
-                return text.casefold()  # más robusto que lower() y preserva acentos
+            # --- Coincidencia exacta address + location + categoría ---
+            if merchant_address and merchant_location and addr_eq and loc_eq:
+                best_match, best_score = existing, 100
+                log_event(f"📍 Coincidencia exacta address+location ({merchant_address}, {merchant_location})")
+                break  # ✅ mejor coincidencia posible
 
-            addr_eq = normalize_case(csv_addr) == normalize_case(existing_addr)
-            loc_eq = normalize_case(csv_loc) == normalize_case(existing_loc)
+            # --- Coincidencia por address + categoría ---
+            elif merchant_address and addr_eq and cat_eq:
+                best_match, best_score = existing, 95
+                log_event(f"🏠 Coincidencia address ({merchant_address})")
+                if merchant_location and not existing_loc:
+                    existing["merchant_location"] = merchant_location
+                break  # ✅ suficientemente fuerte, no seguimos
 
-            # 1️⃣ Si el CSV tiene address o location
-            if csv_addr or csv_loc:
-                # 🟢 Caso 1: address y location son idénticos → actualizar sin comparar merchant_name
-                if addr_eq and loc_eq:
-                    best_match = existing
-                    best_score = 100
-                    log_event(f"📍 Coincidencia exacta address+location ({csv_addr}, {csv_loc}) — sin comparar merchant_name")
+            # --- Coincidencia por location + nombre (sin address) ---
+            elif merchant_location and not merchant_address and cat_eq:
+                simplified_existing = simplify_branch_name(existing_name)
+                name_score = fuzz.ratio(simplified_name.casefold(), simplified_existing.casefold())
+                if name_score > best_score and name_score >= 70:
+                    best_match, best_score = existing, name_score
+                    log_event(
+                        f"📌 Coincidencia location+merchant_name "
+                        f"({merchant_location}, {merchant_name}) - similitud {name_score:.2f}"
+                    )
+                # ⚠️ No hacemos break, seguimos buscando mejores matches
 
-                    # Si el location en BD está vacío y el CSV lo trae → actualizarlo
-                    if not existing_loc and csv_loc:
-                        existing["merchant_location"] = csv_loc
-                    break
+            # --- Coincidencia solo por nombre ---
+            elif not merchant_address and not merchant_location:
+                simplified_existing = simplify_branch_name(existing_name)
+                name_score = fuzz.ratio(simplified_name.casefold(), simplified_existing.casefold())
+                if name_score > best_score and name_score >= 75:
+                    best_match, best_score = existing, name_score
+                    log_event(
+                        f"🏷️ Coincidencia por merchant_name "
+                        f"({merchant_name}) - similitud {name_score:.2f}"
+                    )
+                # ⚠️ Tampoco hacemos break aquí
+     
 
-                # 🟢 Caso 2: address coincide, aunque location sea distinto o vacío
-                elif addr_eq:
-                    best_match = existing
-                    best_score = 95
-                    log_event(f"🏠 Coincidencia address ({csv_addr}) — sin comparar merchant_name")
-
-                    # Si el location de BD está vacío y el CSV lo trae → actualizarlo
-                    if not existing_loc and csv_loc:
-                        existing["merchant_location"] = csv_loc
-                    break
-
-            # 2️⃣ Si no hay address ni location → comparar por merchant_name + campos
-            else:
-                existing_simplified = simplify_branch_name(existing.get("merchant_name", ""))
-                name_score = fuzz.ratio(simplified_name.casefold(), existing_simplified.casefold())
-
-                field_score = 0
-                for campo in compare_fields:
-                    val_new = str(record.get(campo, "") or "")
-                    val_old = str(existing.get(campo, "") or "")
-                    if normalize_case(val_new) == normalize_case(val_old) and val_new:
-                        field_score += 1
-
-                total_score = (name_score * 0.7) + (field_score / len(compare_fields) * 30)
-
-                if total_score > best_score:
-                    best_score = total_score
-                    best_match = existing
-
-        # --- 🧠 Lógica para evitar duplicados ---
+        # --- 🔄 Actualizar si hay match ---
         if best_match:
-            existing_simplified = simplify_branch_name(best_match.get("merchant_name", ""))
-            same_branch = simplified_name == existing_simplified
-
-            # 🛑 Evitar insertar si son el mismo local (aunque el nombre difiera levemente)
-            if same_branch and best_score >= 60:
-                log_event(f"🟢 Mismo comercio detectado ({merchant_name}) — actualizando existente.")
-            elif best_score >= 85 and same_branch:
-                log_event(f"🟢 Coincidencia alta (>{best_score:.2f}%) — evita duplicado.")
-            elif not same_branch and best_score < 75:
-                log_event(f"🏬 Nueva sucursal detectada ({merchant_name}) — se insertará.")
-                insert_pdf_mysql(conn, record)
-                cur.close()
-                return
-
-        # --- 🔄 Actualizar si es misma sucursal ---
-        if best_match and simplify_branch_name(best_match["merchant_name"]) == simplified_name and best_score >= 60:
-            changed_fields = []
-            for field in compare_fields:
-                val_new = record.get(field, "") or ""
-                val_old = best_match.get(field, "") or ""
-                if val_new != val_old and val_new not in ["", None, "NaN"]:
-                    changed_fields.append(field)
-
-            if changed_fields:
-                update_fields = []
-                update_values = []
-
-                update_fields += [
-                    "benefit=%s",
-                    "payment_methods=%s",
-                    "card_brand=%s",
-                    "offer_day=%s",
-                    "valid_to=%s",
-                    "category_name=%s",
-                    "updated_at=NOW()",
-                    "status='A'"
-                ]
-                update_values += [
-                    record.get("benefic", ""),
-                    payment_methods,
-                    card_brand,
-                    record.get("offer_day", ""),
-                    record.get("valid_to", ""),
-                    category_name
-                ]
-
-                if record.get("offer_url") not in [None, "", "NaN"]:
-                    update_fields.append("offer_url=%s")
-                    update_values.append(record["offer_url"])
-
-                if record.get("source_file") not in [None, "", "NaN"]:
-                    update_fields.append("source_file=%s")
-                    update_values.append(record["source_file"])
-
-                sql = f"""
-                    UPDATE web_offers
-                    SET {', '.join(update_fields)}
-                    WHERE id=%s
-                """
-                update_values.append(best_match["id"])
-
-                cur.execute(sql, tuple(update_values))
-                conn.commit()
-                log_event(f"✅ Actualizado (ID={best_match['id']}) con similitud {best_score:.2f}% — Campos: {', '.join(changed_fields)}")
+            if best_match["id"] in processed_ids:
+                log_event(f"⚠ ID {best_match['id']} ya actualizado en esta sesión. Se omite para evitar duplicidad.")
             else:
-                log_event(f"🟢 Registro existente sin cambios (similitud {best_score:.2f}%)")
+                changed_fields = []
+                existing_name = best_match.get("merchant_name", "").strip()
+                csv_name = merchant_name.strip()
+                update_merchant_name = False
+                if " - " not in existing_name and " - " in csv_name:
+                    base_existing = existing_name.upper()
+                    base_csv = csv_name.split(" - ")[0].upper()
+                    if base_existing == base_csv:
+                        changed_fields.append("merchant_name")
+                        update_merchant_name = True
 
+                for f in variable_fields:
+                    val_new = record.get(f)
+                    val_old = best_match.get(f)
+                    if val_new not in [None, "", "NaN"] and val_new != val_old:
+                        changed_fields.append(f)
+
+                if changed_fields:
+                    update_fields = [f"{f}=%s" for f in changed_fields] + ["updated_at=NOW()", "status='A'"]
+                    update_values = [record[f] if f != "merchant_name" else csv_name for f in changed_fields]
+                    update_values.append(best_match["id"])
+                    sql = f"UPDATE web_offers SET {', '.join(update_fields)} WHERE id=%s"
+                    cur.execute(sql, tuple(update_values))
+                    conn.commit()
+                    processed_ids.add(best_match["id"])  # ✅ evitar duplicación posterior
+                    log_event(f"✅ Actualizado (ID={best_match['id']}) con campos: {', '.join(changed_fields)}")
+                else:
+                    log_event(f"🟢 Registro existente sin cambios (ID={best_match['id']})")
         else:
             insert_pdf_mysql(conn, record)
-            log_event(f"🆕 Insertado nuevo registro (similitud {best_score:.2f}%)")
+            log_event(f"🆕 Insertado nuevo registro ({merchant_name})")
 
     except mysql.connector.Error as e:
         conn.rollback()
         log_event(f"⚠ Error MySQL en upsert_offer_mysql: {e}")
     finally:
         cur.close()
-
 
 def ajustar_nombre_comercio(nombre_csv, nombre_pdf, umbral=0.7):
     """
@@ -770,12 +608,22 @@ def extract_text_with_gemini(filepath):
 
         Reglas adicionales para "benefic":
         - Si aparece un beneficio con cuotas, por ejemplo:  
-        "Fraccionar sus compras hasta en 12 (Doce) cuotas sin intereses",  
-        extrae y normaliza únicamente como: **"12 cuotas sin intereses"**.
+          "Fraccionar sus compras hasta en 12 (Doce) cuotas sin intereses",  
+          extrae y normaliza únicamente como: **"12 cuotas sin intereses"**.
         - Si aparece un beneficio con reintegro, por ejemplo:  
-        "recibirá 20% de reintegro en el extracto de la tarjeta de crédito...",  
-        extrae y normaliza únicamente como: **"20% de reintegro"**.
-        - Si el beneficio está redactado en un texto largo, identifica el porcentaje o número de cuotas y devuélvelo en el formato simplificado anterior.
+          "recibirá 20% de reintegro en el extracto de la tarjeta de crédito...",  
+          extrae y normaliza únicamente como: **"20% de reintegro"**.
+        - Si aparece un beneficio con descuento, bonificación o rebaja, por ejemplo:  
+          "20% de descuento en compras en farmacias",  
+          extrae y normaliza únicamente como: **"20% de descuento"**.
+        - **MUY IMPORTANTE:**  
+          - Usa “XX% de descuento” solamente cuando el texto mencione palabras como “descuento”, “bonificación”, “rebaja” o “oferta”.  
+          - Usa “XX% de reintegro” únicamente cuando se mencione explícitamente “reintegro”, “cashback” o “devolución”.  
+          - No confundir “descuento” con “reintegro” aunque ambos sean beneficios monetarios.  
+          - En caso de duda (si el texto no contiene la palabra “reintegro”), asume siempre que se trata de un **descuento**.
+        - Si un subitem contiene varios beneficios distintos (por ejemplo, diferentes planes de cuotas según tipo de tarjeta, reintegros y descuentos), devuelve todos los beneficios como un array dentro de "benefic", 
+            cada beneficio como string individual, en el orden que aparecen en el texto.
+
 
         Reglas adicionales para "marca_tarjeta":
         - Extrae TODAS las marcas o tipos de tarjeta mencionadas, por ejemplo: 
@@ -926,122 +774,116 @@ def parse_gemini_response(gemini_response, full_text):
         # 🚨 Si Gemini devuelve {"error": "No se pudo extraer VIGENCIA"}
         if isinstance(data, dict) and "error" in data:
             log_event(f"⚠ Gemini devolvió error: {data['error']}")
-            return None  # ❌ No devolver datos válidos
-        
+            return None
         
         # DEBUG: formatear JSON y registrarlo en log
         pretty_json = json.dumps(data, indent=2, ensure_ascii=False)
         log_event("🔎 DEBUG Gemini JSON:\n" + pretty_json[:2000])
-        resultados = []
 
-        # Extraer offer_day una vez del texto completo
+        resultados = []
         offer_day = extract_offer_days(full_text)
         log_event(f"Extracted offer_day: {offer_day}")
-        
-        # Caso A: Gemini devuelve directamente una lista
+
+        def normalize_benefic_list(raw):
+            """Si 'benefic' es lista, unir en string; luego normalizar."""
+            if isinstance(raw, list):
+                raw = ", ".join(raw)
+            return normalize_benefic(raw or "")
+
+        def normalize_marcas(src_list):
+            """Recibe lista de strings y devuelve marcas únicas separadas por coma."""
+            marcas_list = []
+            for src in src_list:
+                if not src:
+                    continue
+                for m in re.split(r"[,;]\s*|\s+-\s+", src):
+                    mm = m.strip()
+                    if mm and mm.lower() not in [x.lower() for x in marcas_list]:
+                        marcas_list.append(mm)
+            return ", ".join(marcas_list)
+
+        # --- Caso A: data es lista directa ---
         if isinstance(data, list):
             for item in data:
-                    # Normalizar beneficios (agrupar múltiples)
-                    benef = normalize_benefic(item.get("benefic", ""))
-                    # Normalizar marcas: separar por comas y unificar únicas
-                    marcas_raw = item.get("marca_tarjeta", "")
-                    marcas = []
-                    for m in re.split(r"[,;]\s*|\s+-\s+", marcas_raw) if marcas_raw else []:
-                        mm = m.strip()
-                        if mm and mm.lower() not in [x.lower() for x in marcas]:
-                            marcas.append(mm)
-
-                    resultados.append({
-                        "merchant": item.get("merchant", ""),
-                        "address": item.get("address", ""),
-                        "location": item.get("location", ""),
-                        "benefic": benef,
-                        "valid_from": item.get("valid_from", ""),
-                        "valid_to": item.get("valid_to", ""),
-                        "metodo_pago": item.get("metodo_pago", ""),
-                        "marca_tarjeta": ", ".join(marcas),
-                        "terms_conditions": item.get("term_conditions", ""),
-                        "offer_day": offer_day,  # <-- agregado
-                        "raw_text_snippet": full_text[:800] if full_text else "",
-                        "gemini_response": gemini_response[:500],
-                        "origen": "lista"
-                    })
-            #return resultados
+                benef = normalize_benefic_list(item.get("benefic", ""))
+                marcas = normalize_marcas([item.get("marca_tarjeta", "")])
+                resultados.append({
+                    "merchant": item.get("merchant", ""),
+                    "address": item.get("address", ""),
+                    "location": item.get("location", ""),
+                    "benefic": benef,
+                    "valid_from": item.get("valid_from", ""),
+                    "valid_to": item.get("valid_to", ""),
+                    "metodo_pago": item.get("metodo_pago", ""),
+                    "marca_tarjeta": marcas,
+                    "terms_conditions": item.get("term_conditions", ""),
+                    "offer_day": offer_day,
+                    "raw_text_snippet": full_text[:800] if full_text else "",
+                    "gemini_response": gemini_response[:500],
+                    "origen": "lista"
+                })
             return merge_benefits_by_merchant(resultados)
-        
-        # Caso B: Gemini devuelve un objeto con "promociones" y "comercios"
+
+        # --- Caso B: data es dict con "promociones" y "comercios" ---
         if isinstance(data, dict):
             promociones = data.get("promociones", [])
             comercios = data.get("comercios", [])
 
-            # Cruce promociones + comercios (relleno de campos)
+            # Cruce promociones + comercios
             if promociones and comercios:
                 for promo in promociones:
+                    promo_benef = normalize_benefic_list(promo.get("benefic", ""))
                     for comer in comercios:
-                        benef = normalize_benefic(promo.get("benefic", comer.get("benefic", "")))
-                        # unir marcas de promo y comercio
-                        marcas_list = []
-                        for src in (promo.get("marca_tarjeta", ""), comer.get("marca_tarjeta", "")):
-                            for m in re.split(r"[,;]\s*|\s+-\s+", src) if src else []:
-                                mm = m.strip()
-                                if mm and mm.lower() not in [x.lower() for x in marcas_list]:
-                                    marcas_list.append(mm)
+                        comer_benef = normalize_benefic_list(comer.get("benefic", ""))
+                        benef = promo_benef or comer_benef
 
-                        # terms: preferir promosion, sino comercio, sino extraer exacto del PDF
-                        terms = promo.get("term_conditions", promo.get("terms_conditions", comer.get("term_conditions", "")))
+                        marcas = normalize_marcas([promo.get("marca_tarjeta", ""), comer.get("marca_tarjeta", "")])
+                        terms = promo.get("term_conditions", promo.get("terms_conditions", comer.get("terms_conditions", "")))
 
                         resultados.append({
                             "merchant": comer.get("merchant", promo.get("merchant", "")),
                             "address": comer.get("address", promo.get("address", "")),
                             "location": comer.get("location", promo.get("location", "")),
                             "benefic": benef,
-                            "valid_from": promo["valid_from"],  # <-- siempre de Gemini
-                            "valid_to": promo["valid_to"],      # <-- siempre de Gemini
+                            "valid_from": promo.get("valid_from", ""),
+                            "valid_to": promo.get("valid_to", ""),
                             "metodo_pago": promo.get("metodo_pago", comer.get("metodo_pago", "")),
-                            "marca_tarjeta": ", ".join(marcas_list),
+                            "marca_tarjeta": marcas,
                             "terms_conditions": terms,
-                            "offer_day": offer_day,  # <-- agregado
+                            "offer_day": offer_day,
                             "raw_text_snippet": full_text[:800] if full_text else "",
                             "gemini_response": gemini_response[:500],
                             "origen": "cruce_relleno"
                         })
-                #return resultados
                 return merge_benefits_by_merchant(resultados)
+
             # Solo promociones
             if promociones:
                 for promo in promociones:
-                    benef = normalize_benefic(promo.get("benefic", ""))
-                    marcas = []
-                    for m in re.split(r"[,;]\s*|\s+-\s+", promo.get("marca_tarjeta", "")) if promo.get("marca_tarjeta") else []:
-                        mm = m.strip()
-                        if mm and mm.lower() not in [x.lower() for x in marcas]:
-                            marcas.append(mm)
+                    benef = normalize_benefic_list(promo.get("benefic", ""))
+                    marcas = normalize_marcas([promo.get("marca_tarjeta", "")])
                     resultados.append({
                         "merchant": promo.get("merchant", ""),
                         "address": promo.get("address", ""),
                         "location": promo.get("location", ""),
                         "benefic": benef,
-                        "valid_from": promo["valid_from"],  # <-- siempre de Gemini
-                        "valid_to": promo["valid_to"],      # <-- siempre de Gemini
+                        "valid_from": promo.get("valid_from", ""),
+                        "valid_to": promo.get("valid_to", ""),
                         "metodo_pago": promo.get("metodo_pago", ""),
-                        "marca_tarjeta": ", ".join(marcas),
+                        "marca_tarjeta": marcas,
                         "terms_conditions": promo.get("term_conditions", ""),
-                        "offer_day": offer_day,  # <-- agregado
+                        "offer_day": offer_day,
                         "raw_text_snippet": full_text[:800] if full_text else "",
                         "gemini_response": gemini_response[:500],
                         "origen": "solo_promocion"
                     })
-                #return resultados
                 return merge_benefits_by_merchant(resultados)
+
             # Solo comercios
             if comercios:
                 for comer in comercios:
-                    benef = normalize_benefic(comer.get("benefic", ""))
-                    marcas = []
-                    for m in re.split(r"[,;]\s*|\s+-\s+", comer.get("marca_tarjeta", "")) if comer.get("marca_tarjeta") else []:
-                        mm = m.strip()
-                        if mm and mm.lower() not in [x.lower() for x in marcas]:
-                            marcas.append(mm)
+                    benef = normalize_benefic_list(comer.get("benefic", ""))
+                    marcas = normalize_marcas([comer.get("marca_tarjeta", "")])
                     resultados.append({
                         "merchant": comer.get("merchant", ""),
                         "address": comer.get("address", ""),
@@ -1050,33 +892,35 @@ def parse_gemini_response(gemini_response, full_text):
                         "valid_from": comer.get("valid_from", ""),
                         "valid_to": comer.get("valid_to", ""),
                         "metodo_pago": comer.get("metodo_pago", ""),
-                        "marca_tarjeta": ", ".join(marcas),
-                        "offer_day": offer_day,  # <-- agregado
+                        "marca_tarjeta": marcas,
                         "terms_conditions": comer.get("term_conditions", ""),
+                        "offer_day": offer_day,
                         "raw_text_snippet": full_text[:800] if full_text else "",
                         "gemini_response": gemini_response[:500],
                         "origen": "solo_comercio"
                     })
-                #return resultados
                 return merge_benefits_by_merchant(resultados)
-            # Caso simple: un único dict
+
+            # Caso simple dict
+            benef = normalize_benefic_list(data.get("benefic", ""))
+            marcas = normalize_marcas([data.get("marca_tarjeta", "")])
             resultados.append({
                 "merchant": data.get("merchant", ""),
                 "address": data.get("address", ""),
                 "location": data.get("location", ""),
-                "benefic": data.get("benefic", ""),
+                "benefic": benef,
                 "valid_from": data.get("valid_from", ""),
                 "valid_to": data.get("valid_to", ""),
                 "metodo_pago": data.get("metodo_pago", ""),
-                "marca_tarjeta": data.get("marca_tarjeta", ""),
+                "marca_tarjeta": marcas,
                 "terms_conditions": data.get("term_conditions", data.get("terms_conditions", "")),
-                "offer_day": offer_day,  # <-- agregado
+                "offer_day": offer_day,
                 "raw_text_snippet": full_text[:800] if full_text else "",
                 "gemini_response": gemini_response[:500],
                 "origen": "simple"
             })
-            #return resultados
             return merge_benefits_by_merchant(resultados)
+
     except json.JSONDecodeError as e:
         log_event(f"⚠ Error parseando JSON de Gemini: {e}")
         log_event(f"Respuesta recibida: {gemini_response[:200]}...")
