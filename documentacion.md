@@ -170,3 +170,21 @@ Tipos de datos incorrectos
 Cantidad de tokens
 Errores de base de datos
 Otros eventos excepcionales
+
+### CAMBIOS REALIZADOS 31/10/2025 => ocr_familiar.py => jazmin
+Buscar coincidencias en la base de datos
+- Compara con los registros existentes del mismo banco.
+- Revisa si ya se procesó ese registro en esta sesión.
+- Decide si el nuevo registro coincide con uno existente según:
+1. Dirección + ubicación + categoría → coincidencia perfecta.
+2. Dirección + categoría → coincidencia fuerte.
+3. Ubicación + nombre del comercio → coincidencia media.
+4. Solo nombre del comercio → coincidencia débil.
+Guarda el mejor registro que coincida.
+Actualizar o insertar
+Si hay coincidencia:
+- Actualiza solo los datos que cambiaron.
+- Marca el registro como procesado para no  tocarlo de nuevo en esta sesión.
+Si no hay coincidencia:
+- Inserta el registro como uno nu
+
