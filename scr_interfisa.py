@@ -205,7 +205,9 @@ def main():
             if not matched_category:
                 continue
 
-            pdfs = extract_pdf_from_card(cards_div)
+            # 🔧 PASAMOS LA CATEGORÍA AQUÍ
+            pdfs = extract_pdf_from_card(cards_div, category=matched_category)
+
             for p in pdfs:
                 rec = {
                     "category_name": matched_category,
@@ -217,6 +219,7 @@ def main():
                     "scraped_at": datetime.now(timezone.utc).isoformat()
                 }
                 records.append(rec)
+
 
         logger.info(f"Total de PDFs detectados: {len(records)}")
 
@@ -240,7 +243,6 @@ def main():
     finally:
         if driver:
             driver.quit()
-
 
 if __name__ == "__main__":
     main()

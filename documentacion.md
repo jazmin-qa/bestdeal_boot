@@ -171,7 +171,7 @@ Cantidad de tokens
 Errores de base de datos
 Otros eventos excepcionales
 
-### CAMBIOS REALIZADOS 31/10/2025 => ocr_familiar.py => jazmin
+### 🧾 CAMBIOS REALIZADOS 31/10/2025 => ocr_familiar.py => jazmin
 Buscar coincidencias en la base de datos
 - Compara con los registros existentes del mismo banco.
 - Revisa si ya se procesó ese registro en esta sesión.
@@ -186,5 +186,96 @@ Si hay coincidencia:
 - Actualiza solo los datos que cambiaron.
 - Marca el registro como procesado para no  tocarlo de nuevo en esta sesión.
 Si no hay coincidencia:
-- Inserta el registro como uno nu
+- Inserta el registro como uno nuevo
 
+-----
+
+
+# 🏦 Flujo de Procesamiento — **INTERFISA BANCO**
+📅 **Fecha de actualización:** 04/11/2025  
+📂 **Scripts principales:** `scr_interfisa.py` · `ocr_interfisa.py`
+
+---
+
+## ⚙️ `scr_interfisa.py`
+
+### 🧩 Descripción
+Este script es el **módulo principal del flujo INTERFISA**.  
+Su función es **descargar los archivos PDF** con las ofertas publicadas en la web del banco y luego **invocar al módulo `ocr_interfisa.py`** para su análisis mediante inteligencia artificial.
+
+---
+
+### 🔁 Flujo General del Proceso
+
+#### 1. **Descarga de archivos PDF**
+- El sitio de INTERFISA utiliza un sistema de *scroll infinito*.  
+- El script **simula el desplazamiento del usuario** para permitir que se carguen todas las secciones HTML dinámicas.  
+- Durante este proceso, se identifican las **etiquetas HTML** que contienen:
+  - Las **categorías de comercios**.
+  - Los **enlaces a los archivos PDF** para su posterior descarga.
+
+#### 2. **Categorías procesadas**
+Las categorías identificadas y procesadas son:
+- 🛒 **Supermercados**
+- ⛽ **Estaciones de Servicios**
+- 💊 **Salud y Bienestar**
+
+> En el caso de *Salud y Bienestar*, se aplica un filtro adicional:  
+> solo se descargan **dos comercios específicos** vinculados al rubro farmacéutico.
+
+#### 3. **Invocación del OCR**
+Una vez completada la descarga de los PDFs, se ejecuta el módulo `ocr_interfisa.py`, que procesa y estructura los datos de cada documento.
+
+#### 4. **Recepción y procesamiento de resultados**
+El script recibe los datos estructurados provenientes del OCR:
+- Nombre del comercio (`merchant_name`)
+- Dirección (`address`)
+- Beneficio (`benefit`)
+- Vigencia (`valid_from`, `valid_to`)
+- Métodos de pago (`payment_methods`)
+- Otros metadatos relevantes
+
+#### 5. **Comparación con la base de datos**
+Se aplica una lógica de **comparación por similitud** (*fuzzy matching*) para determinar si cada registro debe:
+- 🔄 **Actualizarse** (si ya existe una coincidencia).
+- 🆕 **Insertarse** (si es un registro nuevo o un beneficio distinto).
+
+---
+
+## 🤖 `ocr_interfisa.py`
+
+### 🧩 Descripción
+Módulo encargado del **procesamiento OCR** y de la **extracción de datos estructurados** desde los archivos PDF descargados por `scr_interfisa.py`.
+
+Utiliza el modelo **Gemini LLM** (mediante API Key configurada en el entorno) para **interpretar el contenido textual** y devolver la información en un formato limpio y estructurado.
+
+---
+
+### 🔁 Flujo del Programa
+
+#### 1. **Extracción de texto desde PDF**
+Cada PDF se analiza usando el modelo **Gemini**, que identifica y organiza los campos principales del documento:
+- Nombre del comercio  
+- Dirección / ubicación  
+- Beneficio  
+- Fechas de vigencia  
+- Días de promoción  
+- Marca de tarjeta o método de pago  
+
+#### 2. **Generación del archivo CSV**
+Una vez completado el análisis, los resultados se guardan en un archivo:
+geminis_resultado_ok_interfisa.csv
+
+Este archivo contiene todos los datos extraídos, normalizados y listos para procesarse en la base de datos.
+
+#### 3. **Inserción y actualización en la base de datos**
+El módulo lee el CSV y ejecuta la lógica de comparación para decidir si cada registro debe **insertarse o actualizarse**.
+
+##### 🔍 Criterios de comparación:
+- Si existen `address` y `location`, la coincidencia se basa en esos campos.
+- Si **no existen**, se utiliza una **clave compuesta alternativa**:
+- Luego se realiza una **comparación campo por campo** para identificar qué valores deben actualizarse o insertarse.
+
+> 💡 *Esta lógica es necesaria porque un mismo comercio puede tener múltiples beneficios activos, con diferentes fechas o condiciones (por ejemplo, distintos días de descuento o porcentajes de reintegro).*
+
+---
